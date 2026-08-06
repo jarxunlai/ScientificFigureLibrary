@@ -120,10 +120,34 @@ test("canonical versioned IDs shadow FigureYa and ordinary routes stay pinned to
     await library.applyCreateWorking(unpublished, "routing-working-v3");
 
     server = await createServer();
-    client = new Client({ name: "server-routing-test", version: "0.4.0" });
+    client = new Client({ name: "server-routing-test", version: "0.4.1" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await server.connect(serverTransport);
     await client.connect(clientTransport);
+
+    const listedTools = await client.listTools();
+    const appCallableTools = [
+      "figure_library_open",
+      "figure_library_search",
+      "figure_capture_open",
+      "figure_capture_article",
+      "figure_capture_list",
+      "figure_capture_get",
+      "figure_capture_asset",
+      "figure_capture_plan_cleanup",
+      "figure_library_review_open",
+      "figure_library_template_history",
+      "figure_library_diff_revisions",
+    ];
+    for (const toolName of appCallableTools) {
+      const listed = listedTools.tools.find((tool) => tool.name === toolName);
+      assert.ok(listed, `missing App-callable tool ${toolName}`);
+      assert.deepEqual(
+        asRecord(asRecord(listed._meta).ui).visibility,
+        ["model", "app"],
+        `${toolName} must be explicitly callable by both the Host Agent and MCP App`,
+      );
+    }
 
     const searched = await client.callTool({
       name: "figure_library_search",

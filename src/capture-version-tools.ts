@@ -813,7 +813,7 @@ export function registerCaptureVersionTools(options: {
         idempotentHint: true,
         openWorldHint: false,
       },
-      _meta: { ui: { resourceUri } },
+      _meta: { ui: { resourceUri, visibility: ["model", "app"] } },
     },
     async (): Promise<CallToolResult> => {
       const status = await captureStore.status();
@@ -849,7 +849,7 @@ export function registerCaptureVersionTools(options: {
         idempotentHint: true,
         openWorldHint: true,
       },
-      _meta: { ui: { resourceUri } },
+      _meta: { ui: { resourceUri, visibility: ["model", "app"] } },
     },
     async (input, extra): Promise<CallToolResult> => {
       try {
@@ -887,7 +887,7 @@ export function registerCaptureVersionTools(options: {
         idempotentHint: true,
         openWorldHint: false,
       },
-      _meta: { ui: { resourceUri } },
+      _meta: { ui: { resourceUri, visibility: ["model", "app"] } },
     },
     async (input): Promise<CallToolResult> => {
       try {
@@ -920,7 +920,7 @@ export function registerCaptureVersionTools(options: {
         idempotentHint: true,
         openWorldHint: false,
       },
-      _meta: { ui: { resourceUri } },
+      _meta: { ui: { resourceUri, visibility: ["model", "app"] } },
     },
     async ({ captureId }): Promise<CallToolResult> => {
       try {
@@ -949,6 +949,7 @@ export function registerCaptureVersionTools(options: {
         idempotentHint: true,
         openWorldHint: false,
       },
+      _meta: { ui: { visibility: ["model", "app"] } },
     },
     async ({ captureId, assetId }): Promise<CallToolResult> => {
       try {
@@ -1002,7 +1003,7 @@ export function registerCaptureVersionTools(options: {
           idempotentHint: true,
           openWorldHint: false,
         },
-        _meta: { ui: { resourceUri } },
+        _meta: { ui: { resourceUri, visibility: ["model", "app"] } },
       },
       async ({ captureId }): Promise<CallToolResult> => {
         try {
@@ -1034,6 +1035,7 @@ export function registerCaptureVersionTools(options: {
         idempotentHint: true,
         openWorldHint: false,
       },
+      _meta: { ui: { visibility: ["model", "app"] } },
     },
     async (input): Promise<CallToolResult> => {
       try {
@@ -1059,7 +1061,7 @@ export function registerCaptureVersionTools(options: {
     "figure_capture_apply_cleanup",
     {
       title: "Apply Capture cleanup (disabled)",
-      description: "Reserved cleanup Apply interface. v0.4.0 always returns cleanup_not_enabled.",
+      description: "Reserved cleanup Apply interface. v0.4.1 always returns cleanup_not_enabled.",
       inputSchema: CleanupApplyInput.shape,
       annotations: {
         readOnlyHint: false,
@@ -1091,7 +1093,7 @@ export function registerCaptureVersionTools(options: {
         idempotentHint: true,
         openWorldHint: false,
       },
-      _meta: { ui: { resourceUri } },
+      _meta: { ui: { resourceUri, visibility: ["model", "app"] } },
     },
     async ({ templateId }): Promise<CallToolResult> => {
       try {
@@ -1180,6 +1182,7 @@ export function registerCaptureVersionTools(options: {
         idempotentHint: true,
         openWorldHint: false,
       },
+      _meta: { ui: { visibility: ["model", "app"] } },
     },
     async ({ templateId }): Promise<CallToolResult> => {
       try {
@@ -1206,6 +1209,7 @@ export function registerCaptureVersionTools(options: {
         idempotentHint: true,
         openWorldHint: false,
       },
+      _meta: { ui: { visibility: ["model", "app"] } },
     },
     async ({ templateId, fromRevisionId, toRevisionId }): Promise<CallToolResult> => {
       try {

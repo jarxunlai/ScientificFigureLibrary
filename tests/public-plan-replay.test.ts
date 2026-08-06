@@ -52,7 +52,7 @@ function candidate(title: string, marker: string) {
 
 async function startClient() {
   const server = await createServer();
-  const client = new Client({ name: "public-plan-replay-test", version: "0.4.0" });
+  const client = new Client({ name: "public-plan-replay-test", version: "0.4.1" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   await client.connect(clientTransport);

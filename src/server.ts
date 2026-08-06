@@ -27,7 +27,7 @@ import {
   type TemplateSeriesV1,
 } from "./versioned-library.ts";
 
-const VERSION = "0.4.0";
+const VERSION = "0.4.1";
 const RESOURCE_URI = "ui://figure-library/candidates.html";
 const APP_HTML = path.resolve(import.meta.dirname, "mcp-app.html");
 
@@ -984,7 +984,7 @@ export async function createServer() {
         idempotentHint: true,
         openWorldHint: false,
       },
-      _meta: { ui: { resourceUri: RESOURCE_URI } },
+      _meta: { ui: { resourceUri: RESOURCE_URI, visibility: ["model", "app"] } },
     },
     async (): Promise<CallToolResult> => ({
       content: [
@@ -1025,7 +1025,7 @@ export async function createServer() {
         idempotentHint: true,
         openWorldHint: false,
       },
-      _meta: { ui: { resourceUri: RESOURCE_URI } },
+      _meta: { ui: { resourceUri: RESOURCE_URI, visibility: ["model", "app"] } },
     },
     async (input): Promise<CallToolResult> => {
       const perSourceRequest = { ...input, reviewStatus: "approved" as const, limit: 12 };

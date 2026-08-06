@@ -24,9 +24,22 @@ figure reference.
 1. Open raw captures with `figure_capture_open`, or capture an explicitly supplied
    article URL with `figure_capture_article`. The server performs deterministic
    HTTP fetching, parsing, hashing, and storage; it does not call another model.
+   In Wisp 0.33, an embedded Workbench may lack
+   `hostCapabilities.serverTools` even though the Host Agent can call every
+   connector tool. If the App reports `MCP error -32601: Capability is not
+   granted by Wisp`, call the requested tool once from the Host Agent and return
+   its result; never loop on `figure_library_open` or `figure_capture_open`.
+   The v0.4.1 App uses `ui/message`, then `ui/update-model-context`, then a
+   copy-ready manual instruction for this fallback.
 2. If capture reports a login challenge, CAPTCHA, or unsupported response, report
    the exact failure. Do not claim that an article was captured and do not install
    a browser runtime silently.
+   If it instead reports `capture_not_configured`, the call reached the server but
+   the Wisp process did not receive `FIGURE_CAPTURE_DIR`; this is separate from
+   the App capability error. Do not retry the URL or change `operationId`. Ask the
+   user to configure a distinct writable directory, fully exit/restart Wisp, and
+   verify `figure_library_source_status` before retrying. No successful Capture
+   receipt exists for that failed operation.
 3. Use `figure_capture_get` and `figure_capture_asset` to inspect the original
    images, code blocks, and context. Captures are retained by default and never
    enter `figure_library_search`. Copyright review is not a publishing Gate for

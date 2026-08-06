@@ -5,6 +5,13 @@ import {
   applyHostStyleVariables,
 } from "@modelcontextprotocol/ext-apps";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import {
+  hasServerToolProxy,
+  hostToolRequestMessage,
+  isServerToolCapabilityError,
+  supportsHostTextMessage,
+  supportsModelContextText,
+} from "./host-tool-routing.ts";
 import "./styles.css";
 
 type LooseRecord = Record<string, unknown>;
@@ -134,8 +141,9 @@ const releaseHistory = byId<HTMLElement>("release-history");
 const reviewAgentRequest = byId<HTMLButtonElement>("review-agent-request");
 const reviewPublishRequest = byId<HTMLButtonElement>("review-publish-request");
 
-const app = new App({ name: "Scientific Figure Library", version: "0.4.0" });
+const app = new App({ name: "Scientific Figure Library", version: "0.4.1" });
 let connected = false;
+let serverToolsDenied = false;
 let currentMode: Mode = "search";
 let captureLoaded = false;
 let reviewLoaded = false;
@@ -294,10 +302,27 @@ function inferMode(value: LooseRecord): Mode | undefined {
 async function callServerTool(
   name: string,
   args: LooseRecord,
-  options: { dispatch?: boolean; busyMessage?: string; timeout?: number } = {},
+  options: {
+    dispatch?: boolean;
+    busyMessage?: string;
+    timeout?: number;
+    allowHostAgentFallback?: boolean;
+  } = {},
 ): Promise<CallToolResult | undefined> {
   if (!connected) {
     setStatus("MCP App 尚未连接 Host，无法调用 Server 工具。", "warning");
+    return;
+  }
+  const capabilities = app.getHostCapabilities();
+  if (!hasServerToolProxy(capabilities, serverToolsDenied)) {
+    if (options.allowHostAgentFallback) {
+      await requestHostTool(name, args);
+    } else {
+      setStatus(
+        "当前 Wisp 未授予 App→Server 工具代理能力；请使用带 Host Agent 回退的按钮，或在对话区直接调用工具。",
+        "warning",
+      );
+    }
     return;
   }
   if (options.busyMessage) setStatus(options.busyMessage, "neutral");
@@ -313,12 +338,62 @@ async function callServerTool(
     if (options.dispatch !== false) dispatchResult(result, modeForTool(name));
     return result;
   } catch (error) {
+    if (isServerToolCapabilityError(error)) {
+      serverToolsDenied = true;
+      root.dataset.serverTools = "unavailable";
+      connection.textContent = "Host 已连接 · Agent 回退";
+      if (options.allowHostAgentFallback) {
+        await requestHostTool(name, args);
+        return;
+      }
+    }
     setStatus(
       `${name} 调用失败：${error instanceof Error ? error.message : String(error)}`,
       "error",
     );
     return;
   }
+}
+
+async function requestHostTool(name: string, args: LooseRecord): Promise<void> {
+  const capabilities = app.getHostCapabilities();
+  const message = hostToolRequestMessage(name, args);
+  if (supportsHostTextMessage(capabilities)) {
+    try {
+      await app.sendMessage({ role: "user", content: [{ type: "text", text: message }] });
+      setStatus(
+        `Wisp 未授权 App 直接调用 ${name}；已通过 Host Agent 发送一次性调用请求，请等待对话结果。`,
+        "warning",
+      );
+      return;
+    } catch {
+      // Some hosts advertise ui/message but still reject it. Fall through safely.
+    }
+  }
+  if (supportsModelContextText(capabilities)) {
+    try {
+      await app.updateModelContext({
+        content: [{ type: "text", text: message }],
+        structuredContent: {
+          source: "Scientific Figure Library MCP App",
+          action: "request_server_tool_once",
+          toolName: name,
+          arguments: args,
+        },
+      });
+      setStatus(
+        `已准备 ${name} 的一次性 Host Agent 请求；请在对话区发送“执行当前 Workbench 请求”。`,
+        "warning",
+      );
+      return;
+    } catch {
+      // The final fallback below is copy-ready and does not claim a call occurred.
+    }
+  }
+  setStatus(
+    `当前 Wisp 不支持 App 工具代理或消息回退。请在对话区手动调用 ${name}(${safeJson(args, 1_000)})。`,
+    "error",
+  );
 }
 
 function setMode(mode: Mode, load = false) {
@@ -338,6 +413,13 @@ function setMode(mode: Mode, load = false) {
   };
   [pageTitle.textContent, pageSummary.textContent] = labels[mode];
   if (!load || !connected) return;
+  if (!hasServerToolProxy(app.getHostCapabilities(), serverToolsDenied)) {
+    setStatus(
+      "当前 Wisp 只允许 Host Agent 直接调用工具。Workbench 不会自动重试；请点击刷新或捕获按钮使用 Agent 回退。",
+      "warning",
+    );
+    return;
+  }
   if (mode === "capture" && !captureLoaded) {
     void callServerTool("figure_capture_open", {}, { busyMessage: "正在读取 Capture 工作台状态…" });
   }
@@ -418,7 +500,7 @@ function renderSearch(value: LooseRecord) {
   const source = firstRecord(value.search, value.result) ?? value;
   const candidates = recordArray(source.candidates).map(normalizeCandidate);
   const searchQuery = firstString(source.query, "等待绘图目标");
-  const version = firstString(source.libraryVersion, "0.4.0");
+  const version = firstString(source.libraryVersion, "0.4.1");
   queryLabel.textContent = `“${searchQuery}” · v${version}`;
   searchCards.replaceChildren();
   searchEmpty.hidden = candidates.length > 0;
@@ -587,7 +669,7 @@ function renderCaptureList() {
       void callServerTool(
         "figure_capture_get",
         { captureId: item.captureId },
-        { busyMessage: `正在读取 ${item.captureId}…` },
+        { busyMessage: `正在读取 ${item.captureId}…`, allowHostAgentFallback: true },
       );
     });
     captureList.append(button);
@@ -1536,7 +1618,10 @@ function renderReview(value: LooseRecord) {
 async function openReview(templateId: string) {
   const args: LooseRecord = {};
   if (templateId.trim()) args.templateId = templateId.trim();
-  await callServerTool("figure_library_review_open", args, { busyMessage: "正在加载 Review Workbench…" });
+  await callServerTool("figure_library_review_open", args, {
+    busyMessage: "正在加载 Review Workbench…",
+    allowHostAgentFallback: true,
+  });
 }
 
 async function refreshReviewHistory() {
@@ -1548,7 +1633,7 @@ async function refreshReviewHistory() {
   const result = await callServerTool(
     "figure_library_template_history",
     { templateId },
-    { dispatch: false, busyMessage: "正在读取 Release History…" },
+    { dispatch: false, busyMessage: "正在读取 Release History…", allowHostAgentFallback: true },
   );
   const output = result && !result.isError ? structured(result) : undefined;
   if (!output) return;
@@ -1573,7 +1658,11 @@ async function refreshReviewDiff() {
   const result = await callServerTool(
     "figure_library_diff_revisions",
     { templateId, fromRevisionId, toRevisionId },
-    { dispatch: false, busyMessage: "正在计算 Published / Working Diff…" },
+    {
+      dispatch: false,
+      busyMessage: "正在计算 Published / Working Diff…",
+      allowHostAgentFallback: true,
+    },
   );
   const output = result && !result.isError ? structured(result) : undefined;
   if (!output) return;
@@ -1688,7 +1777,11 @@ captureForm.addEventListener("submit", (event) => {
   void callServerTool(
     "figure_capture_article",
     { url, operationId: crypto.randomUUID() },
-    { busyMessage: "正在执行 HTTP-first 捕获；遇到登录、Challenge 或 CAPTCHA 将明确停止…", timeout: 120_000 },
+    {
+      busyMessage: "正在执行 HTTP-first 捕获；遇到登录、Challenge 或 CAPTCHA 将明确停止…",
+      timeout: 120_000,
+      allowHostAgentFallback: true,
+    },
   ).finally(() => {
     captureSubmit.disabled = false;
   });
@@ -1698,7 +1791,7 @@ captureRefresh.addEventListener("click", () => {
   void callServerTool(
     "figure_capture_list",
     { includeArchived: includeArchived.checked },
-    { busyMessage: "正在刷新 Capture 列表…" },
+    { busyMessage: "正在刷新 Capture 列表…", allowHostAgentFallback: true },
   );
 });
 includeArchived.addEventListener("change", renderCaptureList);
@@ -1748,7 +1841,12 @@ app
   .connect()
   .then(() => {
     connected = true;
-    connection.textContent = "Host 已连接";
+    const directServerTools = hasServerToolProxy(app.getHostCapabilities(), serverToolsDenied);
+    root.dataset.serverTools = directServerTools ? "available" : "unavailable";
+    connection.textContent = directServerTools ? "Host 已连接" : "Host 已连接 · Agent 回退";
+    connection.title = directServerTools
+      ? "Wisp 已授予 MCP App 直接调用 Server 工具的能力"
+      : "Wisp 未授予 serverTools；用户触发的操作将通过 Host Agent 回退";
     connection.dataset.state = "connected";
     const context = app.getHostContext();
     if (context) {

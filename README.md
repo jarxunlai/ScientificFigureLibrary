@@ -71,7 +71,46 @@ npm run check
 `FIGURE_LIBRARY_DIR` defaults to `~/.figure-library`. `FIGURE_CAPTURE_DIR` has
 no implicit default: Capture status reports `configured: false` with an explicit
 reason while all existing Library and FigureYa functions continue to work. The two configured
-roots must not be equal or nested. The server exposes:
+roots must not be equal or nested.
+
+### Wisp 0.33 capability and Capture configuration diagnostics
+
+Two failures that look similar in the Workbench have different causes:
+
+- `MCP error -32601: Capability is not granted by Wisp` means the embedded MCP
+  App was not granted `hostCapabilities.serverTools`. It does **not** mean that
+  the Figure Library connector or its tools are unavailable to the Host Agent.
+  In v0.4.1 the Workbench detects this state, does not automatically retry an
+  `open` tool, and routes user-triggered actions to the Host Agent once through
+  `ui/message`. If that modality is unavailable it uses
+  `ui/update-model-context`, then finally displays a copy-ready manual call.
+- `capture_not_configured: FIGURE_CAPTURE_DIR is not configured` is returned by
+  the MCP server after a tool call reached it. The App capability is no longer
+  the blocker; the Wisp process did not receive a Capture directory. This error
+  creates no Capture and no successful operation receipt, while existing Library
+  functions remain available. Retrying the URL or changing `operationId` cannot
+  fix it.
+
+For Windows Wisp, configure a distinct writable Windows-native directory in the
+plugin/MCP server environment, or set a persistent user environment variable
+before launching Wisp. For example in PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force 'E:\plot\.wisp\figure-captures'
+[Environment]::SetEnvironmentVariable(
+  'FIGURE_CAPTURE_DIR',
+  'E:\plot\.wisp\figure-captures',
+  'User'
+)
+```
+
+Fully exit every Wisp process and start it again; a restart cannot configure a
+variable that was never set. Then call `figure_library_source_status` and require
+Capture to report `configured: true`, `available: true`, `writable: true`, and
+`isolated: true` before retrying a real article. Keep `FIGURE_LIBRARY_DIR` and
+`FIGURE_CAPTURE_DIR` outside one another.
+
+The server exposes:
 
 - `figure_library_open` — open an empty candidate workbench.
 - `figure_library_search` — search FigureYa and/or the user library.
@@ -103,7 +142,7 @@ roots must not be equal or nested. The server exposes:
   visibility without deleting payloads.
 - `figure_capture_plan_cleanup` — report whether a Capture has a self-contained,
   committed template receipt. `figure_capture_apply_cleanup` is intentionally
-  disabled in v0.4.0.
+  disabled in v0.4.1.
 - `figure_library_plan_working_revision` /
   `figure_library_apply_working_revision` — create or update one complete,
   immutable Working Revision from an explicitly annotated Figure Unit.
@@ -178,7 +217,7 @@ Published Release. A caller may pin an exact historical Published `revisionId` a
 `contentDigest`; the two selectors are mandatory as a pair and must match an immutable
 Release. Working content is available only through the Review Workbench.
 Validation errors and unresolved blocking Gates prevent publication; Warnings are
-retained but nonblocking. Gate waiver is not supported in v0.4.0. Approval and
+retained but nonblocking. Gate waiver is not supported in v0.4.1. Approval and
 publication are one atomic head switch. Restoring history creates a new Working
 candidate and a later new Release; history is never rewound.
 
@@ -463,7 +502,7 @@ and thumbnails, but not the large archive collection:
 
 ```bash
 npm run package:npm
-npm install --global ./release/scientific-figure-library-0.4.0.tgz
+npm install --global ./release/scientific-figure-library-0.4.1.tgz
 ```
 
 Use `scientific-figure-library` as the MCP command after installation.
@@ -474,7 +513,7 @@ For Wisp:
 npm run package:wisp
 ```
 
-Install `release/scientific-figure-library-wisp-0.4.0.zip` from Wisp
+Install `release/scientific-figure-library-wisp-0.4.1.zip` from Wisp
 **Settings → Plugins**, enable it for a project, and start a fresh session.
 
 The Wisp desktop process must resolve **Node.js 22 or newer** from its own
@@ -548,7 +587,7 @@ npm run package:source-pack -- \
 
 The helper verifies every selected ZIP and caps one transport pack at 200 MiB.
 Extract the resulting
-`release/figure-library-source-pack-volcano-0.4.0.zip` before use.
+`release/figure-library-source-pack-volcano-0.4.1.zip` before use.
 
 ## Materialized layouts
 

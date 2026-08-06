@@ -176,7 +176,7 @@ childEnvironment.FIGURE_LIBRARY_DIR = libraryDirectory;
 childEnvironment.FIGURE_CAPTURE_DIR = captureDirectory;
 childEnvironment.FIGURE_CAPTURE_SMOKE_ORIGIN = fixtureOrigin;
 
-const client = new Client({ name: "scientific-figure-library-smoke", version: "0.4.0" });
+const client = new Client({ name: "scientific-figure-library-smoke", version: "0.4.1" });
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: ["--import", captureTransportShimPath, serverEntry],
@@ -298,6 +298,28 @@ try {
   const names = tools.tools.map((tool) => tool.name);
   for (const required of [...legacyTools, ...captureTools, ...versionedTools]) {
     if (!names.includes(required)) throw new Error(`missing tool ${required}`);
+  }
+  const appCallableTools = [
+    "figure_library_open",
+    "figure_library_search",
+    "figure_capture_open",
+    "figure_capture_article",
+    "figure_capture_list",
+    "figure_capture_get",
+    "figure_capture_asset",
+    "figure_capture_plan_cleanup",
+    "figure_library_review_open",
+    "figure_library_template_history",
+    "figure_library_diff_revisions",
+  ];
+  for (const toolName of appCallableTools) {
+    const listed = tools.tools.find((tool) => tool.name === toolName);
+    const visibility = listed?._meta?.ui?.visibility;
+    if (JSON.stringify(visibility) !== JSON.stringify(["model", "app"])) {
+      throw new Error(
+        `${toolName} is not explicitly App-callable: ${JSON.stringify(listed?._meta)}`,
+      );
+    }
   }
 
   const captureOpened = assertSuccessful(
