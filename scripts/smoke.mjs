@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
+import { createServer } from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import fs from "node:fs/promises";
@@ -14,6 +15,7 @@ const serverEntry =
   process.env.FIGURE_LIBRARY_SMOKE_SERVER ?? path.join(root, "dist", "index.js");
 const smokeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "figure-library-smoke-"));
 const libraryDirectory = path.join(smokeRoot, "library");
+const captureDirectory = path.join(smokeRoot, "capture");
 const sourceDirectory = path.join(smokeRoot, "source");
 await fs.mkdir(sourceDirectory);
 const codePath = path.join(sourceDirectory, "smoke-plot.R");
@@ -60,42 +62,919 @@ await fs.writeFile(
   }),
 );
 
+const captureFixtureHtml = await fs.readFile(
+  path.join(root, "tests", "fixtures", "wechat-article.html"),
+);
+const capturePng = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]);
+const captureWebp = new Uint8Array([
+  82, 73, 70, 70, 4, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 32,
+]);
+const fixtureServer = createServer((request, response) => {
+  const url = new URL(request.url ?? "/", "http://127.0.0.1");
+  if (url.pathname === "/s/smoke") {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end(captureFixtureHtml);
+    return;
+  }
+  if (url.pathname === "/test/figure.png") {
+    response.writeHead(200, { "content-type": "image/png" });
+    response.end(capturePng);
+    return;
+  }
+  if (url.pathname === "/test/figure.webp") {
+    response.writeHead(200, { "content-type": "image/webp" });
+    response.end(captureWebp);
+    return;
+  }
+  response.writeHead(404, { "content-type": "text/plain" });
+  response.end("missing fixture");
+});
+await new Promise((resolve, reject) => {
+  fixtureServer.once("error", reject);
+  fixtureServer.listen(0, "127.0.0.1", resolve);
+});
+const fixtureAddress = fixtureServer.address();
+if (!fixtureAddress || typeof fixtureAddress === "string") {
+  throw new Error("capture fixture server did not expose a TCP address");
+}
+const fixtureOrigin = `http://127.0.0.1:${fixtureAddress.port}`;
+const captureTransportShimPath = path.join(sourceDirectory, "capture-transport-shim.mjs");
+await fs.writeFile(
+  captureTransportShimPath,
+  `import dnsPromises from "node:dns/promises";
+import http from "node:http";
+import https from "node:https";
+import { syncBuiltinESMExports } from "node:module";
+
+const fixtureOrigin = process.env.FIGURE_CAPTURE_SMOKE_ORIGIN;
+const fixtureHosts = new Set(["mp.weixin.qq.com", "mmbiz.qpic.cn"]);
+if (!fixtureOrigin) throw new Error("FIGURE_CAPTURE_SMOKE_ORIGIN is required by the test shim");
+const fixture = new URL(fixtureOrigin);
+const nativeLookup = dnsPromises.lookup.bind(dnsPromises);
+const nativeHttpRequest = http.request.bind(http);
+const nativeHttpsRequest = https.request.bind(https);
+
+function normalizedHostname(value) {
+  return String(value ?? "").toLocaleLowerCase().replace(/^\\[|\\]$/gu, "");
+}
+
+function requestHostname(first, second) {
+  let value;
+  if (first instanceof URL || typeof first === "string") {
+    value = new URL(first).hostname;
+  } else if (first && typeof first === "object") {
+    value = first.hostname ?? first.host;
+  }
+  if (second && typeof second === "object") value = second.hostname ?? second.host ?? value;
+  return normalizedHostname(String(value ?? "").split(":", 1)[0]);
+}
+
+dnsPromises.lookup = async (hostname, options) => {
+  if (!fixtureHosts.has(normalizedHostname(hostname))) return nativeLookup(hostname, options);
+  const answer = { address: "93.184.216.34", family: 4 };
+  return options && typeof options === "object" && options.all ? [answer] : answer;
+};
+
+function mappedRequest(nativeRequest, args) {
+  const first = args[0];
+  const second = args[1];
+  const callback = args.findLast((value) => typeof value === "function");
+  if (!fixtureHosts.has(requestHostname(first, second))) return nativeRequest(...args);
+  const sourceOptions =
+    first instanceof URL || typeof first === "string"
+      ? second && typeof second === "object"
+        ? second
+        : {}
+      : first;
+  const mappedOptions = {
+    ...sourceOptions,
+    protocol: fixture.protocol,
+    hostname: fixture.hostname,
+    port: Number(fixture.port),
+    agent: false,
+    lookup: undefined,
+    family: undefined,
+    autoSelectFamily: undefined,
+    servername: undefined,
+    rejectUnauthorized: undefined,
+  };
+  return callback
+    ? nativeHttpRequest(mappedOptions, callback)
+    : nativeHttpRequest(mappedOptions);
+}
+
+http.request = (...args) => mappedRequest(nativeHttpRequest, args);
+https.request = (...args) => mappedRequest(nativeHttpsRequest, args);
+syncBuiltinESMExports();
+`,
+);
+
 const childEnvironment = Object.fromEntries(
   Object.entries(process.env).filter((entry) => typeof entry[1] === "string"),
 );
 childEnvironment.FIGURE_LIBRARY_DIR = libraryDirectory;
+childEnvironment.FIGURE_CAPTURE_DIR = captureDirectory;
+childEnvironment.FIGURE_CAPTURE_SMOKE_ORIGIN = fixtureOrigin;
 
-const client = new Client({ name: "scientific-figure-library-smoke", version: "0.3.0" });
+const client = new Client({ name: "scientific-figure-library-smoke", version: "0.4.0" });
 const transport = new StdioClientTransport({
   command: process.execPath,
-  args: [serverEntry],
+  args: ["--import", captureTransportShimPath, serverEntry],
   stderr: "pipe",
   env: childEnvironment,
 });
 transport.stderr?.on("data", (chunk) => process.stderr.write(chunk));
 
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function structuredPayload(result) {
+  return isRecord(result.structuredContent) ? result.structuredContent : {};
+}
+
+function nestedRecord(value, ...keys) {
+  if (!isRecord(value)) return undefined;
+  for (const key of keys) {
+    if (isRecord(value[key])) return value[key];
+  }
+  return undefined;
+}
+
+function lifecyclePlan(result) {
+  const output = structuredPayload(result);
+  return nestedRecord(output, "plan", "lifecyclePlan") ?? output;
+}
+
+function lifecycleApplyResult(result) {
+  const output = structuredPayload(result);
+  return nestedRecord(output, "result", "applyResult", "receipt") ?? output;
+}
+
+function captureRecord(result) {
+  const output = structuredPayload(result);
+  return nestedRecord(output, "capture", "record", "item") ?? output;
+}
+
+function captureStatus(result) {
+  const output = structuredPayload(result);
+  return nestedRecord(output, "captureStatus", "status", "directoryStatus") ?? output;
+}
+
+function reviewDetail(result) {
+  const output = structuredPayload(result);
+  return nestedRecord(output, "detail", "reviewDetail") ?? output;
+}
+
+function reviewSeries(detail) {
+  return nestedRecord(detail, "series", "templateSeries") ?? detail;
+}
+
+function contentBlockText(result) {
+  return (result.content ?? [])
+    .filter((item) => item.type === "text")
+    .map((item) => item.text)
+    .join("\n");
+}
+
+function assertSuccessful(result, label) {
+  if (result.isError) {
+    throw new Error(`${label} failed: ${contentBlockText(result)}`);
+  }
+  return result;
+}
+
+const legacyTools = [
+  "figure_library_open",
+  "figure_library_search",
+  "figure_library_import",
+  "figure_library_plan_import",
+  "figure_library_apply_import",
+  "figure_library_diff",
+  "figure_library_upsert",
+  "figure_library_sync",
+  "figure_library_archive",
+  "figure_library_preview",
+  "figure_library_source_status",
+  "figure_library_audit",
+  "figure_library_reconcile",
+  "figure_library_describe",
+  "figure_library_materialize",
+];
+
+const captureTools = [
+  "figure_capture_open",
+  "figure_capture_article",
+  "figure_capture_list",
+  "figure_capture_get",
+  "figure_capture_asset",
+  "figure_capture_archive",
+  "figure_capture_restore",
+  "figure_capture_plan_cleanup",
+  "figure_capture_apply_cleanup",
+];
+
+const versionedTools = [
+  "figure_library_plan_working_revision",
+  "figure_library_apply_working_revision",
+  "figure_library_review_open",
+  "figure_library_plan_review_gate_update",
+  "figure_library_apply_review_gate_update",
+  "figure_library_plan_publish_working_revision",
+  "figure_library_apply_publish_working_revision",
+  "figure_library_plan_discard_working_revision",
+  "figure_library_apply_discard_working_revision",
+  "figure_library_plan_restore_release",
+  "figure_library_apply_restore_release",
+  "figure_library_plan_adopt_versioning",
+  "figure_library_apply_adopt_versioning",
+  "figure_library_template_history",
+  "figure_library_diff_revisions",
+];
+
 try {
   await client.connect(transport);
   const tools = await client.listTools();
   const names = tools.tools.map((tool) => tool.name);
-  for (const required of [
-    "figure_library_open",
-    "figure_library_search",
-    "figure_library_import",
-    "figure_library_plan_import",
-    "figure_library_apply_import",
-    "figure_library_diff",
-    "figure_library_upsert",
-    "figure_library_sync",
-    "figure_library_archive",
-    "figure_library_preview",
-    "figure_library_source_status",
-    "figure_library_audit",
-    "figure_library_reconcile",
-    "figure_library_describe",
-    "figure_library_materialize",
-  ]) {
+  for (const required of [...legacyTools, ...captureTools, ...versionedTools]) {
     if (!names.includes(required)) throw new Error(`missing tool ${required}`);
+  }
+
+  const captureOpened = assertSuccessful(
+    await client.callTool({ name: "figure_capture_open", arguments: {} }),
+    "capture open smoke call",
+  );
+  const openedCaptureStatus = captureStatus(captureOpened);
+  const effectiveCaptureRoot =
+    openedCaptureStatus.root ?? openedCaptureStatus.captureDirectory;
+  if (
+    openedCaptureStatus.configured !== true ||
+    openedCaptureStatus.available !== true ||
+    effectiveCaptureRoot !== captureDirectory
+  ) {
+    throw new Error(
+      `capture open did not report the isolated temporary directory: ${JSON.stringify(
+        captureOpened.structuredContent,
+      )}`,
+    );
+  }
+
+  const captureArticleResult = assertSuccessful(
+    await client.callTool({
+      name: "figure_capture_article",
+      arguments: {
+        url: "https://mp.weixin.qq.com/s/smoke",
+        operationId: "smoke-capture-article",
+      },
+    }),
+    "offline capture article smoke call",
+  );
+  const captured = captureRecord(captureArticleResult);
+  const captureId = captured.captureId;
+  const captureVisuals = Array.isArray(captured.visualAssets) ? captured.visualAssets : [];
+  const captureCodes = Array.isArray(captured.codeBlocks) ? captured.codeBlocks : [];
+  const captureContexts = Array.isArray(captured.context) ? captured.context : [];
+  if (
+    typeof captureId !== "string" ||
+    captured.state !== "active" ||
+    captured.article?.title !== "单细胞科研绘图实例" ||
+    captureVisuals.length !== 2 ||
+    captureCodes.length !== 2 ||
+    captureContexts.length < 4
+  ) {
+    throw new Error(
+      `offline capture did not preserve the fixture assets and context: ${JSON.stringify(
+        captureArticleResult.structuredContent,
+      )}`,
+    );
+  }
+
+  const captureReplay = assertSuccessful(
+    await client.callTool({
+      name: "figure_capture_article",
+      arguments: {
+        url: "https://mp.weixin.qq.com/s/smoke",
+        operationId: "smoke-capture-article",
+      },
+    }),
+    "capture operation replay",
+  );
+  if (captureRecord(captureReplay).captureId !== captureId) {
+    throw new Error("capture operation replay returned a different captureId");
+  }
+
+  const captureListed = assertSuccessful(
+    await client.callTool({
+      name: "figure_capture_list",
+      arguments: { includeArchived: false },
+    }),
+    "capture list smoke call",
+  );
+  const captureListOutput = structuredPayload(captureListed);
+  const captureItems = Array.isArray(captureListOutput.captures)
+    ? captureListOutput.captures
+    : Array.isArray(captureListOutput.items)
+      ? captureListOutput.items
+      : [];
+  if (!captureItems.some((item) => item.captureId === captureId)) {
+    throw new Error("capture list did not return the offline fixture capture");
+  }
+
+  const captureGot = assertSuccessful(
+    await client.callTool({
+      name: "figure_capture_get",
+      arguments: { captureId },
+    }),
+    "capture get smoke call",
+  );
+  if (captureRecord(captureGot).source?.fetchMode !== "http-first") {
+    throw new Error("capture get did not preserve HTTP-first provenance");
+  }
+
+  const primaryVisualId = captureVisuals[0]?.assetId;
+  const primaryCodeId = captureCodes[0]?.blockId;
+  const primaryContextId = captureContexts[0]?.blockId;
+  if (!primaryVisualId || !primaryCodeId || !primaryContextId) {
+    throw new Error("capture fixture did not expose stable visual/code/context IDs");
+  }
+  const captureAsset = assertSuccessful(
+    await client.callTool({
+      name: "figure_capture_asset",
+      arguments: { captureId, assetId: primaryVisualId },
+    }),
+    "capture asset smoke call",
+  );
+  if (!captureAsset.content?.some((item) => item.type === "image")) {
+    throw new Error("capture asset fallback tool did not return standard MCP image content");
+  }
+
+  const captureArchived = assertSuccessful(
+    await client.callTool({
+      name: "figure_capture_archive",
+      arguments: { captureId },
+    }),
+    "capture archive smoke call",
+  );
+  if (captureRecord(captureArchived).state !== "archived") {
+    throw new Error("capture archive did not set the logical archived state");
+  }
+  const captureRestored = assertSuccessful(
+    await client.callTool({
+      name: "figure_capture_restore",
+      arguments: { captureId },
+    }),
+    "capture restore smoke call",
+  );
+  if (captureRecord(captureRestored).state !== "active") {
+    throw new Error("capture restore did not reactivate the capture");
+  }
+
+  const cleanupBeforeMaterialization = assertSuccessful(
+    await client.callTool({
+      name: "figure_capture_plan_cleanup",
+      arguments: { captureId, mode: "prune_payload" },
+    }),
+    "capture cleanup readiness before materialization",
+  );
+  const cleanupBeforePlan = lifecyclePlan(cleanupBeforeMaterialization);
+  if (
+    cleanupBeforePlan.ready !== false ||
+    cleanupBeforePlan.deletionEnabled !== false ||
+    typeof cleanupBeforePlan.planDigest !== "string"
+  ) {
+    throw new Error("capture cleanup became ready without a durable versioned receipt");
+  }
+
+  const versionedTemplateId = "smoke-capture-series";
+  const selectionV1 = {
+    visualAssetIds: [primaryVisualId],
+    primaryVisualAssetId: primaryVisualId,
+    codeBlockIds: [primaryCodeId],
+    contextBlockIds: [primaryContextId],
+    canonicalCodeBlockId: primaryCodeId,
+    figureCodeLinks: [
+      {
+        visualAssetId: primaryVisualId,
+        codeBlockIds: [primaryCodeId],
+        evidence: "The fixture keeps the canonical code in an explicit Figure/code relationship.",
+      },
+    ],
+  };
+  const spoofedRuleAssessment = await client.callTool({
+    name: "figure_library_plan_working_revision",
+    arguments: {
+      templateId: "smoke-spoofed-rule-source",
+      mode: "create",
+      captureId,
+      title: "Rejected source spoof",
+      assetKind: "visual_reference",
+      selection: {
+        visualAssetIds: [primaryVisualId],
+        primaryVisualAssetId: primaryVisualId,
+      },
+      assessment: {
+        warnings: [
+          {
+            code: "spoofed_system_finding",
+            message: "Public callers must not label Agent input as a server rule.",
+            source: "system",
+          },
+        ],
+      },
+    },
+  });
+  if (!spoofedRuleAssessment.isError) {
+    throw new Error("public Capture plan accepted a spoofed system/rule assessment source");
+  }
+  const workingPlanV1Result = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_plan_working_revision",
+      arguments: {
+        templateId: versionedTemplateId,
+        mode: "create",
+        captureId,
+        title: "Capture lifecycle smoke v1",
+        description: "Offline capture-backed Figure Unit smoke revision.",
+        tags: ["smoke", "capture"],
+        visualProfile: "one scientific figure with adjacent code",
+        dataProfile: "fixture only; no original research data",
+        packages: ["ggplot2"],
+        license: "Published scientific figure reference",
+        assetKind: "plot_template",
+        plotFamily: "boxplot",
+        selection: selectionV1,
+        assessment: {
+          blockingGates: [
+            {
+              gateId: "review-figure-code-pairing",
+              code: "explicit_pairing_review_required",
+              message: "Smoke requires a separate human review decision for the fixture pairing.",
+              source: "agent",
+            },
+          ],
+        },
+      },
+    }),
+    "working revision v1 plan",
+  );
+  const workingPlanV1 = lifecyclePlan(workingPlanV1Result);
+  const workingPlanV1Output = structuredPayload(workingPlanV1Result);
+  const plannedReviewV1 =
+    workingPlanV1.review ?? workingPlanV1Output.review ?? workingPlanV1Output.reviewSnapshot;
+  if (
+    workingPlanV1.action !== "create_working" ||
+    workingPlanV1.templateId !== versionedTemplateId ||
+    typeof workingPlanV1.planDigest !== "string"
+  ) {
+    throw new Error(
+      `working revision v1 plan returned an invalid contract: ${JSON.stringify(
+        workingPlanV1Result.structuredContent,
+      )}`,
+    );
+  }
+  const pairingGate = plannedReviewV1?.blockingGates?.find(
+    (gate) => gate.gateId === "review-figure-code-pairing",
+  );
+  if (!pairingGate || pairingGate.status !== "open") {
+    throw new Error("working revision plan did not preserve the unresolved figure-code pairing gate");
+  }
+
+  const missingExpectedState = await client.callTool({
+    name: "figure_library_apply_working_revision",
+    arguments: {
+      planDigest: workingPlanV1.planDigest,
+      operationId: "smoke-working-v1-missing-expected-state",
+      expectedAction: "create_working",
+      expectedTemplateId: versionedTemplateId,
+    },
+  });
+  if (!missingExpectedState.isError) {
+    throw new Error("public lifecycle Apply accepted a request without expectedSeriesDigest");
+  }
+
+  const workingAppliedV1Result = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_apply_working_revision",
+      arguments: {
+        planDigest: workingPlanV1.planDigest,
+        operationId: "smoke-working-v1",
+        expectedAction: "create_working",
+        expectedTemplateId: versionedTemplateId,
+        expectedSeriesDigest: workingPlanV1.expectedSeriesDigest,
+      },
+    }),
+    "working revision v1 apply",
+  );
+  const workingAppliedV1 = lifecycleApplyResult(workingAppliedV1Result);
+  const plannedContentV1 = workingPlanV1.content ?? workingPlanV1Output.content;
+  const revisionV1 = workingAppliedV1.revisionId ?? plannedContentV1?.revisionId;
+  const digestV1 = workingAppliedV1.contentDigest ?? plannedContentV1?.contentDigest;
+  if (
+    workingAppliedV1.action !== "create_working" ||
+    typeof revisionV1 !== "string" ||
+    typeof digestV1 !== "string" ||
+    !workingAppliedV1.captureReceiptId
+  ) {
+    throw new Error("working revision v1 apply did not commit a self-contained capture receipt");
+  }
+
+  const reviewOpenV1 = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_review_open",
+      arguments: { templateId: versionedTemplateId },
+    }),
+    "review open v1",
+  );
+  const reviewV1 = reviewDetail(reviewOpenV1);
+  const seriesV1 = reviewSeries(reviewV1);
+  const reviewSnapshotV1 =
+    reviewV1.review ??
+    reviewV1.reviewSnapshot ??
+    reviewV1.workingReview ??
+    reviewV1.working?.review;
+  if (
+    seriesV1.publishedHead !== undefined ||
+    seriesV1.workingHead?.revisionId !== revisionV1 ||
+    !reviewSnapshotV1?.blockingGates?.some(
+      (gate) => gate.gateId === "review-figure-code-pairing" && gate.status === "open",
+    )
+  ) {
+    throw new Error("review open did not expose the unpublished Working Head and open gate");
+  }
+
+  const gatePlanResult = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_plan_review_gate_update",
+      arguments: {
+        templateId: versionedTemplateId,
+        decisions: [
+          {
+            gateId: "review-figure-code-pairing",
+            decision: "resolved",
+            note: "Smoke user explicitly reviewed the fixture figure-code relationship.",
+          },
+        ],
+      },
+    }),
+    "review gate update plan",
+  );
+  const gatePlan = lifecyclePlan(gatePlanResult);
+  if (gatePlan.action !== "update_gates" || typeof gatePlan.planDigest !== "string") {
+    throw new Error("review gate update plan returned an invalid contract");
+  }
+  const gateApplied = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_apply_review_gate_update",
+      arguments: {
+        planDigest: gatePlan.planDigest,
+        operationId: "smoke-review-gate-v1",
+        expectedTemplateId: versionedTemplateId,
+        expectedSeriesDigest: gatePlan.expectedSeriesDigest,
+      },
+    }),
+    "review gate update apply",
+  );
+  if (lifecycleApplyResult(gateApplied).action !== "update_gates") {
+    throw new Error("review gate update apply did not commit a distinct review snapshot");
+  }
+
+  const publishPlanV1Result = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_plan_publish_working_revision",
+      arguments: { templateId: versionedTemplateId },
+    }),
+    "publish v1 plan",
+  );
+  const publishPlanV1 = lifecyclePlan(publishPlanV1Result);
+  if (publishPlanV1.action !== "publish" || typeof publishPlanV1.planDigest !== "string") {
+    throw new Error("publish v1 plan returned an invalid contract");
+  }
+  const publishAppliedV1 = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_apply_publish_working_revision",
+      arguments: {
+        planDigest: publishPlanV1.planDigest,
+        operationId: "smoke-publish-v1",
+        expectedTemplateId: versionedTemplateId,
+        expectedSeriesDigest: publishPlanV1.expectedSeriesDigest,
+      },
+    }),
+    "publish v1 apply",
+  );
+  const publishedV1 = lifecycleApplyResult(publishAppliedV1);
+  const releaseV1 = publishedV1.releaseId ?? publishPlanV1.release?.releaseId;
+  if (
+    publishedV1.action !== "publish" ||
+    typeof releaseV1 !== "string" ||
+    publishedV1.revisionId !== revisionV1
+  ) {
+    throw new Error("publish v1 did not atomically promote the reviewed Working Head");
+  }
+
+  const cleanupAfterMaterialization = assertSuccessful(
+    await client.callTool({
+      name: "figure_capture_plan_cleanup",
+      arguments: { captureId, mode: "prune_payload" },
+    }),
+    "capture cleanup readiness after versioned materialization",
+  );
+  const cleanupReadyPlan = lifecyclePlan(cleanupAfterMaterialization);
+  if (cleanupReadyPlan.ready !== true || typeof cleanupReadyPlan.planDigest !== "string") {
+    throw new Error("capture cleanup did not recognize the durable self-contained revision receipt");
+  }
+  const cleanupApply = await client.callTool({
+    name: "figure_capture_apply_cleanup",
+    arguments: {
+      captureId,
+      mode: "prune_payload",
+      operationId: "smoke-cleanup-disabled",
+      planDigest: cleanupReadyPlan.planDigest,
+    },
+  });
+  if (
+    !cleanupApply.isError ||
+    !contentBlockText(cleanupApply).toLocaleLowerCase().includes("cleanup_not_enabled")
+  ) {
+    throw new Error("capture cleanup apply did not enforce cleanup_not_enabled");
+  }
+
+  const workingPlanV2Result = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_plan_working_revision",
+      arguments: {
+        templateId: versionedTemplateId,
+        mode: "create",
+        captureId,
+        title: "Capture lifecycle smoke v2",
+        description: "A second immutable Working Revision for Published/Working diff coverage.",
+        tags: ["smoke", "capture", "v2"],
+        visualProfile: "one scientific figure with user-confirmed adjacent code",
+        dataProfile: "fixture only; no original research data",
+        packages: ["ggplot2"],
+        license: "Published scientific figure reference",
+        assetKind: "plot_template",
+        plotFamily: "boxplot",
+        selection: {
+          ...selectionV1,
+          figureCodeLinks: [
+            {
+              visualAssetId: primaryVisualId,
+              codeBlockIds: [primaryCodeId],
+              evidence: "The smoke user confirmed the adjacent fixture code belongs to this visual.",
+              confidence: 1,
+            },
+          ],
+        },
+      },
+    }),
+    "working revision v2 plan",
+  );
+  const workingPlanV2 = lifecyclePlan(workingPlanV2Result);
+  const workingPlanV2Output = structuredPayload(workingPlanV2Result);
+  const plannedReviewV2 =
+    workingPlanV2.review ?? workingPlanV2Output.review ?? workingPlanV2Output.reviewSnapshot;
+  if (
+    workingPlanV2.action !== "create_working" ||
+    plannedReviewV2?.blockingGates?.some((gate) => gate.status === "open")
+  ) {
+    throw new Error("working revision v2 did not preserve explicit evidence-backed pairing");
+  }
+  const workingAppliedV2Result = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_apply_working_revision",
+      arguments: {
+        planDigest: workingPlanV2.planDigest,
+        operationId: "smoke-working-v2",
+        expectedAction: "create_working",
+        expectedTemplateId: versionedTemplateId,
+        expectedSeriesDigest: workingPlanV2.expectedSeriesDigest,
+      },
+    }),
+    "working revision v2 apply",
+  );
+  const workingAppliedV2 = lifecycleApplyResult(workingAppliedV2Result);
+  const plannedContentV2 = workingPlanV2.content ?? workingPlanV2Output.content;
+  const revisionV2 = workingAppliedV2.revisionId ?? plannedContentV2?.revisionId;
+  if (typeof revisionV2 !== "string" || revisionV2 === revisionV1) {
+    throw new Error("working revision v2 was not a new immutable revision");
+  }
+
+  const reviewOpenV2 = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_review_open",
+      arguments: { templateId: versionedTemplateId },
+    }),
+    "review open v2",
+  );
+  const reviewV2 = reviewDetail(reviewOpenV2);
+  const seriesV2 = reviewSeries(reviewV2);
+  if (
+    seriesV2.publishedHead?.revisionId !== revisionV1 ||
+    seriesV2.workingHead?.revisionId !== revisionV2
+  ) {
+    throw new Error("Published v1 was not kept live while Working v2 was under review");
+  }
+
+  const revisionDiff = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_diff_revisions",
+      arguments: {
+        templateId: versionedTemplateId,
+        fromRevisionId: revisionV1,
+        toRevisionId: revisionV2,
+      },
+    }),
+    "published-working revision diff",
+  );
+  const diffOutput = nestedRecord(structuredPayload(revisionDiff), "diff", "revisionDiff") ??
+    structuredPayload(revisionDiff);
+  if (
+    !diffOutput.fieldChanges?.some(
+      (change) => change.field === "title" && change.before !== change.after,
+    )
+  ) {
+    throw new Error("Published/Working diff did not report the immutable title change");
+  }
+
+  const publishPlanV2Result = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_plan_publish_working_revision",
+      arguments: { templateId: versionedTemplateId },
+    }),
+    "publish v2 plan",
+  );
+  const publishPlanV2 = lifecyclePlan(publishPlanV2Result);
+  const publishAppliedV2 = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_apply_publish_working_revision",
+      arguments: {
+        planDigest: publishPlanV2.planDigest,
+        operationId: "smoke-publish-v2",
+        expectedTemplateId: versionedTemplateId,
+        expectedSeriesDigest: publishPlanV2.expectedSeriesDigest,
+      },
+    }),
+    "publish v2 apply",
+  );
+  if (lifecycleApplyResult(publishAppliedV2).revisionId !== revisionV2) {
+    throw new Error("publish v2 did not atomically switch the Published Head");
+  }
+
+  const versionHistory = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_template_history",
+      arguments: { templateId: versionedTemplateId },
+    }),
+    "versioned template history",
+  );
+  const historyOutput = nestedRecord(
+    structuredPayload(versionHistory),
+    "history",
+    "templateHistory",
+  ) ?? structuredPayload(versionHistory);
+  if (
+    !Array.isArray(historyOutput.releases) ||
+    historyOutput.releases.length !== 2 ||
+    !historyOutput.releases.some((release) => release.releaseId === releaseV1)
+  ) {
+    throw new Error("versioned history did not retain both immutable releases");
+  }
+
+  const historicalDescription = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_describe",
+      arguments: {
+        templateId: versionedTemplateId,
+        revisionId: revisionV1,
+        contentDigest: digestV1,
+      },
+    }),
+    "exact historical describe",
+  );
+  if (
+    historicalDescription.structuredContent?.revisionId !== revisionV1 ||
+    historicalDescription.structuredContent?.contentDigest !== digestV1 ||
+    historicalDescription.structuredContent?.historical !== true ||
+    historicalDescription.structuredContent?.executionStatus !== "not_run"
+  ) {
+    throw new Error("exact describe did not return the historical not_run revision");
+  }
+
+  const historicalPreviewDirectory = path.join(smokeRoot, "historical-previews");
+  const historicalPreview = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_preview",
+      arguments: {
+        templateId: versionedTemplateId,
+        revisionId: revisionV1,
+        contentDigest: digestV1,
+        destination: historicalPreviewDirectory,
+      },
+    }),
+    "exact historical preview",
+  );
+  if (
+    historicalPreview.structuredContent?.revisionId !== revisionV1 ||
+    historicalPreview.structuredContent?.contentDigest !== digestV1 ||
+    !historicalPreview.content?.some((item) => item.type === "image")
+  ) {
+    throw new Error("exact historical preview did not return standard MCP image content");
+  }
+
+  const historicalMaterialized = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_materialize",
+      arguments: {
+        templateId: versionedTemplateId,
+        revisionId: revisionV1,
+        contentDigest: digestV1,
+        destination: path.join(smokeRoot, "historical-materialized"),
+        mode: "template",
+      },
+    }),
+    "exact historical materialization",
+  );
+  if (
+    historicalMaterialized.structuredContent?.revisionId !== revisionV1 ||
+    historicalMaterialized.structuredContent?.contentDigest !== digestV1 ||
+    !historicalMaterialized.structuredContent?.target
+  ) {
+    throw new Error("exact historical materialization did not preserve the revision lock");
+  }
+
+  const restorePlanResult = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_plan_restore_release",
+      arguments: { templateId: versionedTemplateId, releaseId: releaseV1 },
+    }),
+    "historical Release restore plan",
+  );
+  const restorePlan = lifecyclePlan(restorePlanResult);
+  if (restorePlan.action !== "restore_release" || typeof restorePlan.planDigest !== "string") {
+    throw new Error("historical Release restore plan returned an invalid contract");
+  }
+  const restoreAppliedResult = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_apply_restore_release",
+      arguments: {
+        planDigest: restorePlan.planDigest,
+        operationId: "smoke-restore-v1-as-working",
+        expectedTemplateId: versionedTemplateId,
+        expectedSeriesDigest: restorePlan.expectedSeriesDigest,
+      },
+    }),
+    "historical Release restore apply",
+  );
+  const restoredWorking = lifecycleApplyResult(restoreAppliedResult);
+  if (
+    restoredWorking.action !== "restore_release" ||
+    typeof restoredWorking.revisionId !== "string" ||
+    restoredWorking.revisionId === revisionV1 ||
+    restoredWorking.revisionId === revisionV2
+  ) {
+    throw new Error("historical restore did not create a new immutable Working Revision");
+  }
+  const restoredReviewResult = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_review_open",
+      arguments: { templateId: versionedTemplateId },
+    }),
+    "restored Working review open",
+  );
+  const restoredDetail = reviewDetail(restoredReviewResult);
+  const restoredSeries = reviewSeries(restoredDetail);
+  const restoredReview = restoredDetail.review ?? restoredDetail.reviewSnapshot;
+  if (
+    restoredSeries.publishedHead?.revisionId !== revisionV2 ||
+    restoredSeries.workingHead?.revisionId !== restoredWorking.revisionId ||
+    !restoredReview?.blockingGates?.some(
+      (gate) => gate.gateId === "review-restored-release" && gate.status === "open",
+    )
+  ) {
+    throw new Error("restore rewound Published or omitted mandatory re-review");
+  }
+  const discardPlanResult = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_plan_discard_working_revision",
+      arguments: { templateId: versionedTemplateId },
+    }),
+    "restored Working discard plan",
+  );
+  const discardPlan = lifecyclePlan(discardPlanResult);
+  const discardApplied = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_apply_discard_working_revision",
+      arguments: {
+        planDigest: discardPlan.planDigest,
+        operationId: "smoke-discard-restored-working",
+        expectedTemplateId: versionedTemplateId,
+        expectedSeriesDigest: discardPlan.expectedSeriesDigest,
+      },
+    }),
+    "restored Working discard apply",
+  );
+  if (lifecycleApplyResult(discardApplied).action !== "discard_working") {
+    throw new Error("discard plan did not remove only the restored Working Head");
   }
 
   const opened = await client.callTool({
@@ -207,8 +1086,10 @@ try {
     name: "figure_library_import",
     arguments: { packagePath: transferPackagePath },
   });
+  const transferTemplateId = transferImported.structuredContent?.templateId;
   if (
     transferImported.isError ||
+    typeof transferTemplateId !== "string" ||
     transferImported.structuredContent?.reviewStatus !== "draft" ||
     transferImported.structuredContent?.action !== "create"
   ) {
@@ -321,6 +1202,49 @@ try {
     throw new Error(`user-library audit smoke call failed: ${JSON.stringify(audit.content)}`);
   }
 
+  const adoptionPlanResult = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_plan_adopt_versioning",
+      arguments: { templateId: transferTemplateId },
+    }),
+    "explicit flat-v1 adoption plan",
+  );
+  const adoptionPlan = lifecyclePlan(adoptionPlanResult);
+  if (adoptionPlan.action !== "adopt_legacy" || typeof adoptionPlan.planDigest !== "string") {
+    throw new Error("legacy adoption plan returned an invalid contract");
+  }
+  const adoptionAppliedResult = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_apply_adopt_versioning",
+      arguments: {
+        planDigest: adoptionPlan.planDigest,
+        operationId: "smoke-adopt-transfer-draft",
+        expectedTemplateId: transferTemplateId,
+        expectedSeriesDigest: adoptionPlan.expectedSeriesDigest,
+      },
+    }),
+    "explicit flat-v1 adoption apply",
+  );
+  const adoptionApplied = lifecycleApplyResult(adoptionAppliedResult);
+  if (
+    adoptionApplied.action !== "adopt_legacy" ||
+    typeof adoptionApplied.migrationId !== "string" ||
+    typeof adoptionApplied.revisionId !== "string"
+  ) {
+    throw new Error("legacy adoption did not return a migration receipt and immutable revision");
+  }
+  await fs.access(path.join(libraryDirectory, "templates", transferTemplateId, "template.json"));
+  const adoptedReviewResult = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_review_open",
+      arguments: { templateId: transferTemplateId },
+    }),
+    "adopted draft review open",
+  );
+  if (!reviewSeries(reviewDetail(adoptedReviewResult)).workingHead) {
+    throw new Error("adopted draft did not become an explicit Working candidate");
+  }
+
   const resource = await client.readResource({
     uri: "ui://figure-library/candidates.html",
   });
@@ -367,9 +1291,10 @@ try {
   }
 
   console.log(
-    `OK: ${names.join(", ")}; Agent review preview; legacy import plus plan/apply/archive/audit lifecycle; diff/upsert/sync; user search/materialization; app resource; hard stop${materialized}`,
+    `OK: ${names.join(", ")}; offline Capture open/article/list/get/asset/archive/restore/cleanup guard; immutable Working/Review Gate/Publish v1-v2 lifecycle; Published/Working diff and history; exact historical describe/preview/materialize; restore-as-new-Working/discard; explicit non-destructive legacy adoption; legacy import plus plan/apply/archive/audit lifecycle; diff/upsert/sync; user search/materialization; app resource; hard stop${materialized}`,
   );
 } finally {
   await client.close().catch(() => undefined);
+  await new Promise((resolve) => fixtureServer.close(resolve));
   await fs.rm(smokeRoot, { recursive: true, force: true });
 }

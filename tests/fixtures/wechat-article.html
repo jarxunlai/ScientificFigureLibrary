@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta property="og:title" content="单细胞科研绘图实例">
+  <meta property="og:description" content="演示微信公众号科研图像与代码的确定性抓取。">
+  <meta name="author" content="科研绘图实验室">
+  <meta property="article:published_time" content="2026-08-02T03:04:05+08:00">
+  <title>单细胞科研绘图实例</title>
+</head>
+<body>
+  <h1 id="activity-name">单细胞科研绘图实例</h1>
+  <div id="js_content" class="rich_media_content">
+    <section>
+      <p>图 1 展示不同细胞群的表达分布，并保留文章中的上下文。</p>
+      <img data-src="//mmbiz.qpic.cn/test/figure.png?wx_fmt=png" alt="图 1 单细胞表达分布">
+      <p>下面的 R 代码是文章提供的绘图 scaffold，尚未在本地运行。</p>
+      <pre class="language-r"><code>library(ggplot2)
+ggplot(df, aes(cell_type, expression)) + geom_boxplot()</code></pre>
+      <p>图 2 是第二个独立视觉资产，不应自动与图 1 拼接或裁切。</p>
+      <img data-src="https://mmbiz.qpic.cn/test/figure.webp?wx_fmt=webp" alt="图 2 独立视觉资产">
+      <p>文章还包含一个 Python 片段，图像与代码的配对需要用户审核。</p>
+      <code class="language-python">import seaborn as sns
+sns.boxplot(data=df, x="cell_type", y="expression")</code>
+    </section>
+  </div>
+  <script>var ignored_secret = "not article context";</script>
+</body>
+</html>

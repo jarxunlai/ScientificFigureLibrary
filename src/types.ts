@@ -77,6 +77,11 @@ export interface ManagementReference {
 
 export interface TemplateCandidate {
   templateId: string;
+  revisionId?: string;
+  releaseId?: string;
+  contentDigest?: string;
+  publishedAt?: string;
+  historical?: boolean;
   sourceId: "figureya" | "user";
   sourceLabel: string;
   title: string;

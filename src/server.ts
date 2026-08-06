@@ -9,15 +9,25 @@ import {
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult, ReadResourceResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { buildSearchIntent, CatalogIndex } from "./catalog.ts";
+import { buildSearchIntent, CatalogIndex, scoreSearchableTemplate } from "./catalog.ts";
 import {
   inspectFigureYaSourcePack,
   materializeFigureYaTemplate,
 } from "./materialize.ts";
+import { CaptureStore } from "./capture.ts";
+import { registerCaptureVersionTools } from "./capture-version-tools.ts";
 import type { TemplateCandidate } from "./types.ts";
 import { managementReference, UserTemplateLibrary } from "./user-library.ts";
+import {
+  VersionedTemplateLibrary,
+  type JsonValue,
+  type PublishedVersionedTemplateCandidate,
+  type TemplateContentV1,
+  type TemplateReleaseV1,
+  type TemplateSeriesV1,
+} from "./versioned-library.ts";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const RESOURCE_URI = "ui://figure-library/candidates.html";
 const APP_HTML = path.resolve(import.meta.dirname, "mcp-app.html");
 
@@ -44,6 +54,11 @@ const ManagementSchema = z.object({
 
 const CandidateSchema = z.object({
   templateId: z.string(),
+  revisionId: z.string().optional(),
+  releaseId: z.string().optional(),
+  contentDigest: z.string().optional(),
+  publishedAt: z.string().optional(),
+  historical: z.boolean().optional(),
   sourceId: z.enum(["figureya", "user"]),
   sourceLabel: z.string(),
   title: z.string(),
@@ -94,7 +109,10 @@ const SearchInput = z.object({
     .describe("Filter reusable plotting templates separately from visual-only references."),
   language: z.string().min(1).max(100).optional(),
   plotFamily: z.string().min(1).max(200).optional(),
-  reviewStatus: z.enum(["draft", "approved", "archived"]).optional(),
+  reviewStatus: z
+    .literal("approved")
+    .optional()
+    .describe("Ordinary search exposes only the current published/approved revision."),
   codeStatus: z.enum(["none", "scaffold", "reviewed"]).optional(),
   sourceIds: z
     .array(z.enum(["figureya", "user"]))
@@ -407,12 +425,32 @@ const RegistrySchema = z.object({
   fingerprints: FingerprintsSchema.optional(),
 });
 
-const DescribeInput = z.object({
+function exactSelectorSchema<T extends z.ZodRawShape>(shape: T) {
+  return z.object(shape).superRefine((value, context) => {
+    const selector = value as { revisionId?: string; contentDigest?: string };
+    if (Boolean(selector.revisionId) !== Boolean(selector.contentDigest)) {
+      context.addIssue({
+        code: "custom",
+        message: "revisionId and contentDigest must be provided together",
+      });
+    }
+  });
+}
+
+const DescribeInput = exactSelectorSchema({
   templateId: z.string().min(1).max(200),
+  revisionId: z.string().min(1).max(200).optional(),
+  contentDigest: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
 });
 
 const DescribeOutput = z.object({
   templateId: z.string(),
+  revisionId: z.string().optional(),
+  releaseId: z.string().optional(),
+  contentDigest: z.string().optional(),
+  publishedAt: z.string().optional(),
+  historical: z.boolean().optional(),
+  executionStatus: z.enum(["not_run", "passed", "failed"]).optional(),
   sourceId: z.enum(["figureya", "user"]),
   sourceLabel: z.string(),
   title: z.string(),
@@ -442,8 +480,10 @@ const DescribeOutput = z.object({
   management: ManagementSchema,
 });
 
-const PreviewInput = z.object({
+const PreviewInput = exactSelectorSchema({
   templateId: z.string().min(1).max(200),
+  revisionId: z.string().min(1).max(200).optional(),
+  contentDigest: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
   destination: z
     .string()
     .min(1)
@@ -456,6 +496,10 @@ const PreviewInput = z.object({
 
 const PreviewOutput = z.object({
   templateId: z.string(),
+  revisionId: z.string().optional(),
+  releaseId: z.string().optional(),
+  contentDigest: z.string().optional(),
+  historical: z.boolean().optional(),
   sourceId: z.enum(["figureya", "user"]),
   mimeType: z.string(),
   bytes: z.number().int(),
@@ -464,8 +508,10 @@ const PreviewOutput = z.object({
   instruction: z.string(),
 });
 
-const MaterializeInput = z.object({
+const MaterializeInput = exactSelectorSchema({
   templateId: z.string().min(1).max(200),
+  revisionId: z.string().min(1).max(200).optional(),
+  contentDigest: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
   destination: z
     .string()
     .min(1)
@@ -493,10 +539,15 @@ const MaterializeInput = z.object({
 
 const MaterializeOutput = z.object({
   templateId: z.string(),
+  revisionId: z.string().optional(),
+  releaseId: z.string().optional(),
+  contentDigest: z.string().optional(),
+  receiptId: z.string().optional(),
+  historical: z.boolean().optional(),
   sourceId: z.enum(["figureya", "user"]),
   target: z.string(),
   mode: z.enum(["template", "full"]),
-  materializationSource: z.enum(["user-library", "source-pack", "network"]),
+  materializationSource: z.enum(["versioned-library", "user-library", "source-pack", "network"]),
   sourceLocation: z.string().optional(),
   archiveSha256: z.string().optional(),
   files: z.array(z.string()),
@@ -530,6 +581,31 @@ const SourceStatusOutput = z.object({
   legacyTemplateCount: z.number().int(),
   invalidTemplateCount: z.number().int(),
   duplicateGroupCount: z.number().int(),
+  captureStatus: z.object({
+    configured: z.boolean(),
+    enabled: z.boolean(),
+    source: z.enum(["constructor", "environment", "unconfigured"]),
+    root: z.string().optional(),
+    libraryRoot: z.string().optional(),
+    isolated: z.boolean(),
+    exists: z.boolean(),
+    readable: z.boolean(),
+    writable: z.boolean(),
+    creatable: z.boolean(),
+    available: z.boolean(),
+    accessible: z.boolean(),
+    reason: z.string().optional(),
+  }),
+  versionedLibrary: z.object({
+    root: z.string(),
+    directorySource: z.enum(["argument", "FIGURE_LIBRARY_DIR", "default"]),
+    exists: z.boolean(),
+    readable: z.boolean(),
+    writable: z.boolean(),
+    seriesCount: z.number().int(),
+    publishedCount: z.number().int(),
+    workingCount: z.number().int(),
+  }),
   figureYa: z.object({
     catalogTemplates: z.number().int(),
     sourcePackConfigured: z.boolean(),
@@ -630,6 +706,219 @@ const ReconcileOutput = z.object({
   written: z.boolean(),
 });
 
+
+type SearchToolInput = z.infer<typeof SearchInput>;
+
+interface ReleasedVersion {
+  series: TemplateSeriesV1;
+  content: TemplateContentV1;
+  release: TemplateReleaseV1;
+  historical: boolean;
+}
+
+function jsonRecord(value: JsonValue | undefined): Record<string, JsonValue> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, JsonValue>)
+    : undefined;
+}
+
+function provenanceForOutput(value: JsonValue | undefined) {
+  const record = jsonRecord(value);
+  if (!record) return undefined;
+  const output: Record<string, string | string[]> = {};
+  for (const key of [
+    "producer",
+    "producerVersion",
+    "exportedAt",
+    "sourceId",
+    "figureId",
+    "parentFigureId",
+    "figureLabel",
+    "caption",
+    "paperTitle",
+    "year",
+    "journal",
+    "doi",
+    "page",
+    "url",
+    "licenseScope",
+    "rights",
+  ] as const) {
+    if (typeof record[key] === "string") output[key] = record[key];
+  }
+  for (const key of ["subfigureLabels", "authors"] as const) {
+    const selected = record[key];
+    if (Array.isArray(selected) && selected.every((item) => typeof item === "string")) {
+      output[key] = selected as string[];
+    }
+  }
+  const captureSource = jsonRecord(record.source);
+  const captureArticle = jsonRecord(record.article);
+  if (!output.url) {
+    const sourceUrl = captureSource?.finalUrl ?? captureSource?.url;
+    if (typeof sourceUrl === "string") output.url = sourceUrl;
+  }
+  if (!output.exportedAt && typeof captureSource?.capturedAt === "string") {
+    output.exportedAt = captureSource.capturedAt;
+  }
+  if (!output.paperTitle && typeof captureArticle?.title === "string") {
+    output.paperTitle = captureArticle.title;
+  }
+  if (!output.authors && typeof captureArticle?.author === "string") {
+    output.authors = [captureArticle.author];
+  }
+  return Object.keys(output).length ? output : undefined;
+}
+
+async function releasedVersion(
+  library: VersionedTemplateLibrary,
+  templateId: string,
+  revisionId?: string,
+  contentDigest?: string,
+): Promise<ReleasedVersion | undefined> {
+  const series = await library.getSeries(templateId);
+  if (!series) return undefined;
+  if (Boolean(revisionId) !== Boolean(contentDigest)) {
+    throw new Error("revisionId and contentDigest must be provided together");
+  }
+  let release: TemplateReleaseV1 | undefined;
+  let historical = false;
+  if (revisionId && contentDigest) {
+    const history = await library.history(templateId);
+    release = history.releases.find(
+      (item) => item.revisionId === revisionId && item.contentDigest === contentDigest,
+    );
+    if (!release) {
+      throw new Error("the exact selector is not a published release");
+    }
+    historical =
+      series.publishedHead?.revisionId !== revisionId ||
+      series.publishedHead.contentDigest !== contentDigest;
+  } else {
+    const head = series.publishedHead;
+    if (!head) throw new Error(`template has no Published revision: ${templateId}`);
+    release = await library.getRelease(templateId, head.releaseId);
+    if (!release) throw new Error(`Published release is missing: ${head.releaseId}`);
+    revisionId = head.revisionId;
+    contentDigest = head.contentDigest;
+  }
+  const content = await library.getContent(templateId, revisionId, contentDigest);
+  if (!content) throw new Error(`Published content is missing: ${templateId}/${revisionId}`);
+  if (release.revisionId !== content.revisionId || release.contentDigest !== content.contentDigest) {
+    throw new Error("Published Release and Content Revision do not match");
+  }
+  return { series, content, release, historical };
+}
+
+function matchesVersionedFilters(
+  candidate: PublishedVersionedTemplateCandidate,
+  request: SearchToolInput,
+) {
+  const same = (left: string, right: string) =>
+    left.trim().toLocaleLowerCase() === right.trim().toLocaleLowerCase();
+  if (request.assetKind && candidate.assetKind !== request.assetKind) return false;
+  if (request.language && !same(candidate.language, request.language)) return false;
+  if (request.plotFamily && !same(candidate.plotFamily, request.plotFamily)) return false;
+  if (request.codeStatus && candidate.codeStatus !== request.codeStatus) return false;
+  return true;
+}
+
+async function searchVersionedPublished(
+  library: VersionedTemplateLibrary,
+  request: SearchToolInput,
+): Promise<TemplateCandidate[]> {
+  const intent = buildSearchIntent(request);
+  const scored = [] as Array<{ candidate: TemplateCandidate; score: number }>;
+  for (const item of await library.listPublishedCandidates()) {
+    if (!matchesVersionedFilters(item, request)) continue;
+    const content = await library.getContent(item.templateId, item.revisionId, item.contentDigest);
+    if (!content) throw new Error(`Published content is missing: ${item.templateId}`);
+    const inputFiles = content.assets
+      .filter((asset) => asset.role === "data")
+      .map((asset) => asset.logicalPath);
+    const codeFiles = content.assets
+      .filter((asset) => asset.role === "code")
+      .map((asset) => asset.logicalPath);
+    const evidence = scoreSearchableTemplate(
+      {
+        templateId: item.templateId,
+        title: item.title,
+        description: item.description,
+        application: item.visualProfile,
+        dataProfile: item.dataProfile,
+        inputFiles,
+        codeFiles,
+        packages: item.packages,
+        tags: item.tags,
+      },
+      intent,
+    );
+    if (evidence.score <= 0) continue;
+    const provenance = provenanceForOutput(content.provenance);
+    const sourceUrl = typeof provenance?.url === "string" ? provenance.url : undefined;
+    const warnings: string[] = [];
+    if (item.assetKind === "visual_reference") {
+      warnings.push("只有视觉参考，没有可靠的 canonical 绘图实现");
+    }
+    if (item.codeStatus === "scaffold" || item.executionStatus === "not_run") {
+      warnings.push("代码未运行；scaffold/not_run 不代表复现或验证成功");
+    }
+    const previewAsset = content.assets.find(
+      (asset) => asset.logicalPath === content.primaryPreview,
+    );
+    const previewAvailable = Boolean(
+      previewAsset && ["image/png", "image/jpeg", "image/webp"].includes(previewAsset.mediaType),
+    );
+    scored.push({
+      score: evidence.score,
+      candidate: {
+        templateId: item.templateId,
+        revisionId: item.revisionId,
+        releaseId: item.releaseId,
+        contentDigest: item.contentDigest,
+        publishedAt: item.publishedAt,
+        historical: false,
+        sourceId: "user",
+        sourceLabel: "Scientific Figure Library",
+        title: item.title,
+        retrievalScore: evidence.score,
+        matchedTerms: evidence.matchedTerms.slice(0, 12),
+        reasons: evidence.reasons,
+        warnings,
+        excerpt: item.description.slice(0, 420),
+        description: item.description,
+        application: item.visualProfile,
+        dataProfile: item.dataProfile,
+        inputFiles,
+        codeFiles,
+        packages: [...item.packages],
+        materializable: true,
+        previewAvailable,
+        assetKind: item.assetKind,
+        language: item.language,
+        plotFamily: item.plotFamily,
+        reviewStatus: "approved",
+        codeStatus: item.codeStatus,
+        license: item.license,
+        ...(sourceUrl ? { sourceUrl } : {}),
+        management: {
+          templateId: item.templateId,
+          canArchive: false,
+          canUpdate: true,
+          updateVia: "plan-apply",
+        },
+      },
+    });
+  }
+  return scored
+    .sort(
+      (left, right) =>
+        right.score - left.score || left.candidate.templateId.localeCompare(right.candidate.templateId),
+    )
+    .slice(0, Math.min(Math.max(request.limit ?? 6, 1), 12))
+    .map((item) => item.candidate);
+}
+
 function candidateText(candidates: TemplateCandidate[]) {
   if (candidates.length === 0) return "No matching scientific figure templates were found.";
   const list = candidates
@@ -673,6 +962,8 @@ function hardStop(templateId: string, error: unknown): CallToolResult {
 export async function createServer() {
   const index = await CatalogIndex.load();
   const userLibrary = new UserTemplateLibrary();
+  const captureStore = new CaptureStore();
+  const versionedLibrary = new VersionedTemplateLibrary();
   const server = new McpServer({
     name: "Scientific Figure Library",
     version: VERSION,
@@ -711,7 +1002,7 @@ export async function createServer() {
         reviewRequired: false,
         sources: [
           { sourceId: "figureya", sourceLabel: "FigureYa", matched: 0 },
-          { sourceId: "user", sourceLabel: "User Library", matched: 0 },
+          { sourceId: "user", sourceLabel: "Scientific Figure Library", matched: 0 },
         ],
         candidates: [],
       },
@@ -737,13 +1028,28 @@ export async function createServer() {
       _meta: { ui: { resourceUri: RESOURCE_URI } },
     },
     async (input): Promise<CallToolResult> => {
-      const perSourceRequest = { ...input, limit: 12 };
-      const figureYaCandidates = input.sourceIds.includes("figureya")
-        ? await index.withPreviews(index.search(perSourceRequest))
-        : [];
-      const userCandidates = input.sourceIds.includes("user")
-        ? await userLibrary.search(perSourceRequest)
-        : [];
+      const perSourceRequest = { ...input, reviewStatus: "approved" as const, limit: 12 };
+      const [series, unshadowedFigureYaCandidates] = await Promise.all([
+        versionedLibrary.listSeries({ includeArchived: true }),
+        input.sourceIds.includes("figureya")
+          ? index.withPreviews(index.search(perSourceRequest))
+          : Promise.resolve([] as TemplateCandidate[]),
+      ]);
+      const canonicalIds = new Set(series.map((item) => item.templateId));
+      const figureYaCandidates = unshadowedFigureYaCandidates.filter(
+        (candidate) => !canonicalIds.has(candidate.templateId),
+      );
+      let userCandidates: TemplateCandidate[] = [];
+      if (input.sourceIds.includes("user")) {
+        const [published, legacy] = await Promise.all([
+          searchVersionedPublished(versionedLibrary, perSourceRequest),
+          userLibrary.search(perSourceRequest),
+        ]);
+        userCandidates = [
+          ...published,
+          ...legacy.filter((candidate) => !canonicalIds.has(candidate.templateId)),
+        ];
+      }
       const ranked = [...figureYaCandidates, ...userCandidates]
         .sort((left, right) => {
           const retrieval = right.retrievalScore - left.retrievalScore;
@@ -771,7 +1077,7 @@ export async function createServer() {
           },
           {
             sourceId: "user" as const,
-            sourceLabel: "User Library",
+            sourceLabel: "Scientific Figure Library",
             matched: userCandidates.length,
           },
         ],
@@ -803,6 +1109,13 @@ export async function createServer() {
       ],
     }),
   );
+
+  registerCaptureVersionTools({
+    server,
+    captureStore,
+    versionedLibrary,
+    resourceUri: RESOURCE_URI,
+  });
 
   server.registerTool(
     "figure_library_import",
@@ -1194,7 +1507,7 @@ export async function createServer() {
         "Return the selected candidate preview as standard MCP image content. Optionally copy it " +
         "to a project-local directory so a Wisp Agent can call view_image. Use this to visually " +
         "audit the top retrieval candidate before making a final recommendation.",
-      inputSchema: PreviewInput.shape,
+      inputSchema: PreviewInput,
       outputSchema: PreviewOutput.shape,
       annotations: {
         readOnlyHint: false,
@@ -1203,8 +1516,79 @@ export async function createServer() {
         openWorldHint: false,
       },
     },
-    async ({ templateId, destination }): Promise<CallToolResult> => {
+    async ({ templateId, revisionId, contentDigest, destination }): Promise<CallToolResult> => {
       try {
+        const versioned = await releasedVersion(
+          versionedLibrary,
+          templateId,
+          revisionId,
+          contentDigest,
+        );
+        if (versioned) {
+          const preview = await versionedLibrary.getPreview(templateId, {
+            revisionId: versioned.content.revisionId,
+            contentDigest: versioned.content.contentDigest,
+          });
+          if (!preview) throw new Error(`no preview is available for ${templateId}`);
+          if (!["image/png", "image/jpeg", "image/webp"].includes(preview.mimeType)) {
+            throw new Error(`preview media type is not safe for inline rendering: ${preview.mimeType}`);
+          }
+          const digest = createHash("sha256").update(preview.bytes).digest("hex");
+          let outputPath;
+          if (destination) {
+            const directory = path.resolve(destination);
+            await fs.mkdir(directory, { recursive: true });
+            const safeId =
+              templateId.replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^[._-]+/gu, "") ||
+              "template";
+            outputPath = path.join(
+              directory,
+              `${safeId}-${digest.slice(0, 12)}${preview.extension}`,
+            );
+            try {
+              await fs.writeFile(outputPath, preview.bytes, { flag: "wx" });
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+              const existing = new Uint8Array(await fs.readFile(outputPath));
+              if (createHash("sha256").update(existing).digest("hex") !== digest) {
+                throw new Error(`refusing to overwrite a different preview: ${outputPath}`);
+              }
+            }
+          }
+          const instruction = outputPath
+            ? `Call view_image on ${outputPath}, compare it with the user's request/reference, and return an Agent visual-review verdict plus a score out of 10.`
+            : "Compare this image with the user's request/reference and return an Agent visual-review verdict plus a score out of 10.";
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Published preview ready for ${templateId}. ${instruction}`,
+              },
+              {
+                type: "image",
+                data: Buffer.from(preview.bytes).toString("base64"),
+                mimeType: preview.mimeType,
+              },
+            ],
+            structuredContent: {
+              templateId,
+              revisionId: versioned.content.revisionId,
+              releaseId: versioned.release.releaseId,
+              contentDigest: versioned.content.contentDigest,
+              historical: versioned.historical,
+              sourceId: "user" as const,
+              mimeType: preview.mimeType,
+              bytes: preview.bytes.byteLength,
+              sha256: digest,
+              ...(outputPath ? { path: outputPath } : {}),
+              instruction,
+            },
+          };
+        }
+        if (revisionId || contentDigest) {
+          throw new Error("exact revision selectors are supported only for versioned Published releases");
+        }
+
         const figureYaPreview = await index.preview(templateId);
         const userPreview = figureYaPreview ? undefined : await userLibrary.preview(templateId);
         const preview = figureYaPreview ?? userPreview;
@@ -1306,9 +1690,11 @@ export async function createServer() {
           galleryDirectoryAccessible = false;
         }
       }
-      const [audit, figureYa] = await Promise.all([
+      const [audit, figureYa, captureStatus, versionedStatus] = await Promise.all([
         userLibrary.auditTemplates({ scope: "all", includeArchived: true }),
         inspectFigureYaSourcePack(index.catalog, sourcePackDir),
+        captureStore.status(),
+        versionedLibrary.status(),
       ]);
       const output = {
         libraryDirectory: userLibrary.root,
@@ -1333,6 +1719,11 @@ export async function createServer() {
         legacyTemplateCount: audit.legacyTemplateCount,
         invalidTemplateCount: audit.invalidTemplateCount,
         duplicateGroupCount: audit.duplicateGroupCount,
+        captureStatus: {
+          ...captureStatus,
+          accessible: captureStatus.available,
+        },
+        versionedLibrary: versionedStatus,
         figureYa: {
           catalogTemplates: index.catalog.modules.length,
           sourcePackConfigured: figureYa.configured,
@@ -1349,10 +1740,11 @@ export async function createServer() {
           {
             type: "text",
             text:
-              `${audit.userTemplateCount} user templates; ${audit.invalidTemplateCount} invalid; ` +
-              `${audit.duplicateGroupCount} duplicate groups; ${index.catalog.modules.length} FigureYa ` +
-              `catalog templates; ${figureYa.availableTemplates.length} FigureYa archives available ` +
-              "in the configured Source Pack.",
+              `${audit.userTemplateCount} flat templates; ${versionedStatus.seriesCount} versioned Series; ` +
+              `${versionedStatus.publishedCount} Published; ${versionedStatus.workingCount} Working; ` +
+              `Capture ${captureStatus.available ? "available" : captureStatus.configured ? "unavailable" : "not configured"}; ` +
+              `${index.catalog.modules.length} FigureYa catalog templates; ` +
+              `${figureYa.availableTemplates.length} FigureYa archives available.`,
           },
         ],
         structuredContent: output,
@@ -1458,7 +1850,7 @@ export async function createServer() {
     {
       title: "Describe a scientific figure template",
       description: "Return structured, read-only details for one exact template ID.",
-      inputSchema: DescribeInput.shape,
+      inputSchema: DescribeInput,
       outputSchema: DescribeOutput.shape,
       annotations: {
         readOnlyHint: true,
@@ -1467,7 +1859,95 @@ export async function createServer() {
         openWorldHint: false,
       },
     },
-    async ({ templateId }): Promise<CallToolResult> => {
+    async ({ templateId, revisionId, contentDigest }): Promise<CallToolResult> => {
+      try {
+        const versioned = await releasedVersion(
+          versionedLibrary,
+          templateId,
+          revisionId,
+          contentDigest,
+        );
+        if (versioned) {
+          const { series, content, release, historical } = versioned;
+          const provenance = provenanceForOutput(content.provenance);
+          const sourceUrl = provenance?.url;
+          const inputFiles = content.assets
+            .filter((asset) => asset.role === "data")
+            .map((asset) => asset.logicalPath);
+          const codeFiles = content.assets
+            .filter((asset) => asset.role === "code")
+            .map((asset) => asset.logicalPath);
+          const previewAsset = content.assets.find(
+            (asset) => asset.logicalPath === content.primaryPreview,
+          );
+          const output = {
+            templateId,
+            revisionId: content.revisionId,
+            releaseId: release.releaseId,
+            contentDigest: content.contentDigest,
+            publishedAt: release.publishedAt,
+            historical,
+            executionStatus: content.executionStatus,
+            sourceId: "user" as const,
+            sourceLabel: "Scientific Figure Library",
+            title: content.title,
+            description: content.description,
+            application: content.visualProfile,
+            dataProfile: content.dataProfile,
+            inputFiles,
+            codeFiles,
+            packages: content.packages,
+            materializable: true,
+            previewAvailable: Boolean(
+              previewAsset &&
+                ["image/png", "image/jpeg", "image/webp"].includes(previewAsset.mediaType),
+            ),
+            assetKind: content.assetKind,
+            language: content.language,
+            plotFamily: content.plotFamily,
+            reviewStatus: series.status === "archived" ? ("archived" as const) : ("approved" as const),
+            codeStatus: content.codeStatus,
+            license: content.license,
+            ...(sourceUrl ? { sourceUrl } : {}),
+            importedAt: content.createdAt,
+            ...(content.primaryPreview ? { previewFile: content.primaryPreview } : {}),
+            ...(provenance ? { provenance } : {}),
+            management: {
+              templateId,
+              canArchive: false,
+              canUpdate: series.status !== "archived",
+              ...(series.status !== "archived" ? { updateVia: "plan-apply" as const } : {}),
+            },
+          };
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `# ${templateId} [Scientific Figure Library]\n\n${content.description || "Scientific figure reference."}\n\n` +
+                  `Revision: ${content.revisionId}\nRelease: ${release.releaseId}\n` +
+                  `Code: ${codeFiles.join(", ") || "visual reference only"}\n` +
+                  `Execution: ${content.executionStatus}; not_run is not reproduced or verified.`,
+              },
+            ],
+            structuredContent: output,
+          };
+        }
+        if (revisionId || contentDigest) {
+          throw new Error("exact revision selectors are supported only for versioned Published releases");
+        }
+      } catch (error) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Template description failed: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+        };
+      }
+
       const module = index.get(templateId);
       if (module) {
         const output = {
@@ -1591,7 +2071,7 @@ export async function createServer() {
         "Copy a selected user template or acquire a commit-pinned FigureYa archive. Never " +
         "overwrites or executes code. If this tool returns any error, stop immediately, report " +
         "it, and do not retry, fetch another archive, recreate the template, or draw a substitute.",
-      inputSchema: MaterializeInput.shape,
+      inputSchema: MaterializeInput,
       outputSchema: MaterializeOutput.shape,
       annotations: {
         readOnlyHint: false,
@@ -1602,12 +2082,60 @@ export async function createServer() {
     },
     async ({
       templateId,
+      revisionId,
+      contentDigest,
       destination,
       mode,
       sourcePackDir,
       allowNetwork,
     }): Promise<CallToolResult> => {
       try {
+        const versioned = await releasedVersion(
+          versionedLibrary,
+          templateId,
+          revisionId,
+          contentDigest,
+        );
+        if (versioned) {
+          if (mode !== "template") {
+            throw new Error("full mode is supported only for FigureYa archives");
+          }
+          const result = await versionedLibrary.materializeRevision({
+            templateId,
+            revisionId: versioned.content.revisionId,
+            contentDigest: versioned.content.contentDigest,
+            destination,
+          });
+          const output = {
+            templateId,
+            revisionId: versioned.content.revisionId,
+            releaseId: versioned.release.releaseId,
+            contentDigest: versioned.content.contentDigest,
+            historical: versioned.historical,
+            sourceId: "user" as const,
+            target: result.target,
+            mode,
+            materializationSource: "versioned-library" as const,
+            files: result.files,
+            warning:
+              "Immutable Published reference only. No code was executed; scaffold/not_run is not reproduced or verified.",
+          };
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Materialized Published ${templateId}/${versioned.content.revisionId} at ${result.target} ` +
+                  `(${result.files.length} files).\n${output.warning}`,
+              },
+            ],
+            structuredContent: output,
+          };
+        }
+        if (revisionId || contentDigest) {
+          throw new Error("exact revision selectors are supported only for versioned Published releases");
+        }
+
         const module = index.get(templateId);
         if (module) {
           const result = await materializeFigureYaTemplate({
@@ -1643,6 +2171,9 @@ export async function createServer() {
           };
         }
 
+        if (mode !== "template") {
+          throw new Error("full mode is supported only for FigureYa archives");
+        }
         const result = await userLibrary.materialize(templateId, destination);
         const output = {
           templateId,

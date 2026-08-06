@@ -5,12 +5,16 @@ importing, and materializing scientific figure references. It is not tied to
 Wisp: any stdio MCP host can use it. The included Wisp manifest and Skill are a
 thin optional adapter.
 
-The library has two template sources:
+ScientificFigureLibrary is the canonical schema, asset, review, and lifecycle
+authority. It exposes two searchable template sources and one isolated raw input
+store:
 
 - **FigureYa** — 319 searchable modules with local thumbnails and
   commit-pinned archives.
-- **User Library** — figures and plotting code copied from paths supplied by
-  the MCP host.
+- **ScientificFigureLibrary user store** — immutable, versioned figures and
+  plotting code curated by the user, plus readable flat-v1 compatibility entries.
+- **Capture store** — raw web-article images, code, and context in a separate
+  `FIGURE_CAPTURE_DIR`; Capture payloads never enter ordinary template search.
 
 The host Agent analyzes an uploaded image, a natural-language request, or a data
 file. It builds a compact retrieval intent, searches both sources, inspects the
@@ -55,6 +59,7 @@ npm run check
       "args": ["/absolute/path/to/ScientificFigureLibrary/dist/index.js"],
       "env": {
         "FIGURE_LIBRARY_DIR": "/absolute/path/to/my-figure-library",
+        "FIGURE_CAPTURE_DIR": "/absolute/path/to/my-figure-captures",
         "FIGURE_GALLERY_DIR": "/optional/path/to/my-personal-gallery",
         "FIGUREYA_SOURCE_PACK_DIR": "/optional/path/to/FigureYaSourcePack"
       }
@@ -63,7 +68,10 @@ npm run check
 }
 ```
 
-`FIGURE_LIBRARY_DIR` defaults to `~/.figure-library`. The server exposes:
+`FIGURE_LIBRARY_DIR` defaults to `~/.figure-library`. `FIGURE_CAPTURE_DIR` has
+no implicit default: Capture status reports `configured: false` with an explicit
+reason while all existing Library and FigureYa functions continue to work. The two configured
+roots must not be equal or nested. The server exposes:
 
 - `figure_library_open` — open an empty candidate workbench.
 - `figure_library_search` — search FigureYa and/or the user library.
@@ -84,8 +92,27 @@ npm run check
   `templateId`, legacy `galleryId`, or adapter-scoped Registry source.
 - `figure_library_preview` — return a candidate as MCP image content and,
   optionally, a checked project-local preview path for Agent inspection.
-- `figure_library_source_status` — inspect effective User Library/Gallery paths,
-  lifecycle counts, integrity counts, and a FigureYa Source Pack.
+- `figure_library_source_status` — inspect effective Library, Capture, legacy
+  Gallery, and FigureYa paths plus lifecycle/integrity counts.
+- `figure_capture_open`, `figure_capture_article`, `figure_capture_list`, and
+  `figure_capture_get` — capture and inspect web articles in the isolated
+  Capture/Annotation Workbench.
+- `figure_capture_asset` — return one raw image as MCP image content; this is the
+  fallback when a host does not proxy dynamic `figure-capture://` resources.
+- `figure_capture_archive` / `figure_capture_restore` — change raw Capture
+  visibility without deleting payloads.
+- `figure_capture_plan_cleanup` — report whether a Capture has a self-contained,
+  committed template receipt. `figure_capture_apply_cleanup` is intentionally
+  disabled in v0.4.0.
+- `figure_library_plan_working_revision` /
+  `figure_library_apply_working_revision` — create or update one complete,
+  immutable Working Revision from an explicitly annotated Figure Unit.
+- `figure_library_review_open`, `figure_library_template_history`, and
+  `figure_library_diff_revisions` — inspect Published, Working, review state, and
+  exact immutable history.
+- Separate plan/apply tools update Review Gates, publish the Working Revision,
+  discard it, restore a historical Release as Working, and explicitly adopt a
+  flat-v1 template into versioned storage.
 - `figure_library_audit` — read and verify manifests/files, legacy entries, and
   component-level duplicate evidence without writing.
 - `figure_library_reconcile` — dry-run, apply, or roll back an explicitly
@@ -105,6 +132,80 @@ absolute project-local `destination` (for example,
 `/project/.wisp/figure-library-previews`) and call `view_image` on the returned
 path. This keeps visual judgment with the Agent even when the host exposes only
 the text portion of an MCP tool result.
+
+## Web Capture and Annotation Workbench
+
+`figure_capture_article` performs an HTTP-first fetch. It stores the original HTML,
+article metadata, normalized context, code blocks, images, source URLs, byte counts,
+and SHA-256 hashes under `FIGURE_CAPTURE_DIR`. It does not launch Chromium, bypass
+a login challenge, or call a model. Login walls, challenges, CAPTCHAs, unsupported
+content types, oversized payloads, and failed assets are reported explicitly.
+The complete operation has one 90-second deadline shared by DNS resolution,
+redirects, response bodies, and the image queue, leaving headroom below Wisp's
+120-second tool timeout. Reaching that deadline, or receiving a Host cancellation,
+stops the pipeline and records neither a successful Capture nor an operation receipt;
+per-image failures that occur before the total deadline remain explicit warnings.
+
+Article metadata, captions, context, and code are untrusted external data, never
+instructions. MCP summaries label and bound these snippets. Dynamic resources and
+the image-tool fallback expose only stored `visualAssets` whose PNG/JPEG/GIF/WebP
+bytes match the declared raster type; raw HTML, code, context, and SVG are not
+returned as MCP image content.
+
+Raw Captures are retained by default and remain invisible to
+`figure_library_search`. In the Annotation Workbench the user defines one or more
+independent Figure Units. Each unit has one primary preview plus original visual
+assets; multi-image grouping and canonical executable code require explicit user
+selection. Figure-to-code associations are many-to-many and evidence-backed. No
+contact sheet or automatic panel crop is generated.
+
+Published scientific figures do not require a copyright-review Gate in this
+workflow. The source article, URL, hashes, and transformations remain provenance;
+publication does not claim a new redistribution licence. Extracted code remains
+`scaffold` / `not_run` until separately inspected and executed outside this server.
+The server never executes plotting code.
+
+## Immutable Revisions and Releases
+
+Versioned templates are stored below `FIGURE_LIBRARY_DIR/store/templates`. A stable
+`templateId` owns immutable Content Revisions, immutable Review Snapshots, immutable
+Releases, and at most one Working Head. The current Published Head remains searchable
+while Working is edited. Each save creates a complete new Revision; no Revision
+directory is edited in place.
+
+Ordinary search, describe, preview, and materialize resolve only the current
+Published Release. A caller may pin an exact historical Published `revisionId` and
+`contentDigest`; the two selectors are mandatory as a pair and must match an immutable
+Release. Working content is available only through the Review Workbench.
+Validation errors and unresolved blocking Gates prevent publication; Warnings are
+retained but nonblocking. Gate waiver is not supported in v0.4.0. Approval and
+publication are one atomic head switch. Restoring history creates a new Working
+candidate and a later new Release; history is never rewound.
+
+Existing `figure-library.template.v1` directories remain readable. Their first
+versioned edit requires explicit non-destructive adopt plan/apply. The original
+manifest remains untouched in the legacy directory; the migration receipt records
+its file name and SHA-256. No startup process silently rewrites the legacy store.
+
+Lifecycle plans are read-only and are held only for the current server session. If
+the server restarts before Apply, create and review a fresh plan. Once an Apply has
+completed, its public plan digest is bound into the durable operation receipt, so
+repeating the same operation ID and expectations can replay the completed result
+across a restart. A different digest or expectation is rejected.
+Every public lifecycle Apply must echo the reviewed plan's `planDigest`,
+`templateId`, and nullable `expectedSeriesDigest` (plus `expectedAction` for a
+Working Revision); omitting the expected state is rejected.
+
+Fresh Apply first writes and verifies its immutable objects, then writes a durable
+intent containing the exact pre-state, post-state, immutable-object bindings, and
+auxiliary receipts, and only then changes the Series pointer. After a crash, public
+replay can roll an exact pre-state with complete bound objects forward across a
+restart; an exact post-state can backfill missing operation, Capture, or migration
+receipts. For compatibility, an older or residual prior intent whose bound objects
+are incomplete still requires the same backend plan to finish those objects and is
+not rolled forward from the journal alone. A stale write lock is removed
+automatically only when its owner record is valid and its PID is confirmed dead;
+live or corrupt locks stop writes for manual inspection.
 
 ## Stable direct imports
 
@@ -225,8 +326,10 @@ changes, inspect it with `figure_library_diff`, then explicitly apply it with
 
 ## Personal Gallery v1
 
-The Gallery remains the editable source of truth; the User Library is a
-rebuildable search snapshot. A Gallery root contains entries like:
+Personal Gallery v1 remains a compatibility import/export and R-editing format.
+ScientificFigureLibrary is authoritative: Gallery sync may populate flat-v1
+compatibility entries but must not overwrite a canonical versioned Published or
+Working Revision. A Gallery root contains entries like:
 
 ```text
 gallery/lab-volcano/
@@ -293,10 +396,10 @@ Preview a complete sync without writing:
 Set `dryRun` to `false` only after reviewing the returned per-field diffs.
 Sync imports approved entries, skips drafts, and treats `archived` as a logical
 archive rather than a deletion. Missing entries are never deleted implicitly.
-Default search includes approved entries only; an explicit `reviewStatus`
-filter can be used for review/audit. Search and sync also accept `assetKind`,
-`language`, `plotFamily`, and `codeStatus` filters, keeping visual-only
-references separate from reusable R templates.
+Ordinary search includes approved/current Published entries only. Draft, Working,
+and archived entries are accessed through review/audit tools, never by widening
+the ordinary search filter. Search and sync also accept `assetKind`, `language`,
+`plotFamily`, and `codeStatus` filters.
 
 ## Identity, management, audit, and reconcile
 
@@ -312,10 +415,11 @@ source. Audit therefore calculates separate `manifestSha256` and
 `verifiedFileSetDigest` values from the current manifest and verified files.
 
 Search and describe return a `management` object. Use its `templateId` as the
-normal archive reference. `registrySourceId` is deliberately distinct from the
-top-level search source (`figureya` or `user`). Gallery authority remains in
-`figure.yml`; if a Gallery snapshot is locally archived while its Gallery entry
-is still approved, the next sync will plan to restore the authoritative state.
+normal lifecycle reference. `registrySourceId` is deliberately distinct from the
+top-level search source (`figureya` or `user`). For flat-v1 compatibility entries,
+Gallery sync can still propose a source-snapshot update. Once a canonical Series
+exists for the same template ID, its Published and Working Heads take precedence
+and Gallery sync must not replace them.
 
 Audit before any legacy cleanup:
 
@@ -359,7 +463,7 @@ and thumbnails, but not the large archive collection:
 
 ```bash
 npm run package:npm
-npm install --global ./release/scientific-figure-library-0.3.0.tgz
+npm install --global ./release/scientific-figure-library-0.4.0.tgz
 ```
 
 Use `scientific-figure-library` as the MCP command after installation.
@@ -370,8 +474,46 @@ For Wisp:
 npm run package:wisp
 ```
 
-Install `release/scientific-figure-library-wisp-0.3.0.zip` from Wisp
+Install `release/scientific-figure-library-wisp-0.4.0.zip` from Wisp
 **Settings → Plugins**, enable it for a project, and start a fresh session.
+
+The Wisp desktop process must resolve **Node.js 22 or newer** from its own
+`PATH`; a Node installation visible only inside WSL is not automatically visible
+to a Windows Wisp process. Verify `node --version` from the same Windows account
+before loading the plugin. The ZIP does not bundle Node, Chromium, or Playwright.
+
+Before the first Capture test, configure distinct absolute
+`FIGURE_LIBRARY_DIR` and `FIGURE_CAPTURE_DIR` values in the Wisp MCP server
+environment. When Wisp runs the plugin with Windows Node, use Windows-native
+paths, for example `E:\ScientificFigureLibraryData` and
+`E:\ScientificFigureCaptures`, not `/mnt/e/...`. The roots must be different,
+must not contain one another, and the Capture root must not be a symlink or
+junction into the Library. If Wisp is deliberately bridged to WSL Node, use two
+distinct Linux absolute paths instead. Then use this local acceptance sequence:
+
+1. `figure_library_source_status` reports both path sources, writable status, and
+   `isolated: true`.
+2. Capture a real WeChat article, inspect its images/code/context in the full-screen
+   Annotation Workbench, and confirm that ordinary search contains no raw Capture.
+3. Archive and restore that Capture, verify payloads remain present, and confirm an
+   archived Capture cannot create a Working Revision until it is restored.
+4. Create a Working Figure Unit, inspect Published/Working/Diff and all review
+   errors/Gates/Warnings, then publish only when no blocking item remains.
+   Test both an evidence-backed canonical code selection and a code-free
+   `visual_reference`.
+5. While editing an approved template, verify that its prior Published Revision
+   remains the ordinary search result. After publication, pin and preview/materialize
+   the historical Revision with `revisionId` and `contentDigest` supplied together;
+   a partial selector must fail.
+6. Restore a historical Release as a new Working candidate and verify that history
+   was extended rather than rewound.
+7. Confirm cleanup readiness changes only after a self-contained Revision receipt,
+   and that cleanup Apply still returns `cleanup_not_enabled` without deleting data.
+8. Confirm dynamic Capture resources and the `figure_capture_asset` image-tool
+   fallback. Record any Wisp proxy limitation or HTTP challenge verbatim.
+
+A successful build or stdio smoke test does not prove Wisp integration. Treat the
+ZIP as awaiting local Wisp acceptance until this checklist is completed.
 
 ## FigureYa Source Pack
 
@@ -406,7 +548,7 @@ npm run package:source-pack -- \
 
 The helper verifies every selected ZIP and caps one transport pack at 200 MiB.
 Extract the resulting
-`release/figure-library-source-pack-volcano-0.3.0.zip` before use.
+`release/figure-library-source-pack-volcano-0.4.0.zip` before use.
 
 ## Materialized layouts
 

@@ -6,23 +6,195 @@
     <title>Scientific Figure Library</title>
   </head>
   <body>
-    <main id="app">
-      <header>
-        <div>
-          <p class="eyebrow">SCIENTIFIC FIGURE LIBRARY</p>
-          <h1>选择科学绘图模板</h1>
-          <p id="query" class="query">正在等待候选结果…</p>
+    <main id="app" data-mode="search">
+      <header class="app-header">
+        <div class="brand-block">
+          <p class="eyebrow">SCIENTIFIC FIGURE LIBRARY · 0.4.0</p>
+          <h1 id="page-title">科学图表工作台</h1>
+          <p id="page-summary" class="page-summary">搜索已发布模板，或进入隔离的 Capture 与 Review 工作流。</p>
         </div>
-        <p class="hint">优先检查数据兼容性，再比较视觉风格</p>
+        <div class="host-controls">
+          <span id="connection" class="connection" data-state="connecting">正在连接 Host</span>
+          <button id="fullscreen" class="secondary compact" type="button" disabled>全屏</button>
+        </div>
       </header>
 
-      <section id="empty" class="empty" aria-live="polite">
-        请在对话中上传图片或数据，也可以直接描述想画的图。
+      <nav class="mode-tabs" role="tablist" aria-label="工作台模式">
+        <button id="tab-search" class="mode-tab" type="button" role="tab" data-mode="search" aria-controls="view-search" aria-selected="true">模板搜索</button>
+        <button id="tab-capture" class="mode-tab" type="button" role="tab" data-mode="capture" aria-controls="view-capture" aria-selected="false">Capture / Annotation</button>
+        <button id="tab-review" class="mode-tab" type="button" role="tab" data-mode="review" aria-controls="view-review" aria-selected="false">Working Review</button>
+      </nav>
+
+      <section id="view-search" class="mode-view" role="tabpanel" aria-labelledby="tab-search">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">PUBLISHED ONLY</p>
+            <h2>普通模板搜索</h2>
+            <p id="query" class="muted">正在等待候选结果…</p>
+          </div>
+          <p class="section-note">召回分数不是最终推荐；仍需 Agent 查看预览并完成视觉审核。</p>
+        </div>
+        <div id="search-empty" class="empty" aria-live="polite">请在对话中上传图片或数据，也可以直接描述想画的图。</div>
+        <div id="cards" class="cards" aria-label="Scientific figure template candidates"></div>
       </section>
-      <section id="cards" class="cards" aria-label="Scientific figure template candidates"></section>
-      <footer id="status" aria-live="polite">
-        分数只表示候选召回顺序；Agent 必须查看候选预览后再做最终推荐。
-      </footer>
+
+      <section id="view-capture" class="mode-view" role="tabpanel" aria-labelledby="tab-capture" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">ISOLATED RAW CAPTURE</p>
+            <h2>网页捕获与 Figure Unit 标注</h2>
+            <p class="muted">Raw Capture 不进入普通搜索；只有明确提交的 Annotation Proposal 才交给 Host Agent 继续处理。</p>
+          </div>
+        </div>
+
+        <form id="capture-form" class="action-bar">
+          <label class="grow-field">
+            <span>微信公众号文章 URL</span>
+            <input id="capture-url" name="url" type="url" inputmode="url" autocomplete="url" placeholder="https://mp.weixin.qq.com/s/..." required />
+          </label>
+          <button id="capture-submit" type="submit">HTTP-first 捕获</button>
+          <button id="capture-refresh" class="secondary" type="button">刷新 Capture</button>
+        </form>
+        <div id="capture-status" class="directory-status" aria-live="polite"></div>
+
+        <div class="capture-layout">
+          <aside class="capture-sidebar" aria-label="Capture 列表">
+            <div class="aside-heading">
+              <h3>Capture 记录</h3>
+              <label class="inline-check"><input id="include-archived" type="checkbox" /> 包含已归档</label>
+            </div>
+            <div id="capture-list" class="record-list">
+              <p class="empty-compact">尚未加载 Capture。</p>
+            </div>
+          </aside>
+
+          <div id="annotation-empty" class="empty annotation-empty">选择一个 Capture 后，在这里确认独立 Figure Unit。</div>
+          <article id="annotation-workbench" class="annotation-workbench" hidden>
+            <div class="workbench-heading">
+              <div>
+                <p id="capture-state" class="status-pill">ACTIVE</p>
+                <h3 id="capture-title">Untitled capture</h3>
+                <p id="capture-meta" class="muted"></p>
+              </div>
+              <div class="button-row">
+                <button id="capture-archive-request" class="secondary compact" type="button">请求归档</button>
+                <button id="capture-cleanup-request" class="secondary compact" type="button">检查清理条件</button>
+              </div>
+            </div>
+
+            <section class="annotation-section">
+              <div class="subheading">
+                <div><span class="step">1</span><h4>选择视觉资产</h4></div>
+                <p>一个 Draft = 一个可独立搜索复用的 Figure Unit；多图组合必须显式确认。</p>
+              </div>
+              <div id="visual-assets" class="asset-grid"></div>
+              <label id="group-confirm-wrap" class="confirm-box" hidden>
+                <input id="group-confirm" type="checkbox" />
+                <span>我确认所选多张图片属于同一个 Figure Unit，而不是多个应拆分的模板。</span>
+              </label>
+            </section>
+
+            <section class="annotation-section">
+              <div class="subheading">
+                <div><span class="step">2</span><h4>选择代码与上下文</h4></div>
+                <p>未运行的提取代码始终是 scaffold / not_run，不表示复现成功。</p>
+              </div>
+              <div class="asset-columns">
+                <div>
+                  <h5>Code blocks</h5>
+                  <div id="code-assets" class="select-list"></div>
+                </div>
+                <div>
+                  <h5>Context blocks</h5>
+                  <div id="context-assets" class="select-list"></div>
+                </div>
+              </div>
+            </section>
+
+            <section class="annotation-section">
+              <div class="subheading">
+                <div><span class="step">3</span><h4>Figure–Code 证据关系</h4></div>
+                <p>关系可以是多对多；每条被确认的关系都必须写明证据。</p>
+              </div>
+              <div id="pairing-matrix" class="pairing-list"></div>
+            </section>
+
+            <section class="annotation-section">
+              <div class="subheading">
+                <div><span class="step">4</span><h4>Annotation Proposal</h4></div>
+                <p>这一步只更新 Host 上下文，不直接写入 ScientificFigureLibrary。</p>
+              </div>
+              <div class="form-grid">
+                <label class="span-2"><span>模板标题</span><input id="proposal-title" type="text" maxlength="200" /></label>
+                <label><span>资产类型</span><select id="proposal-kind"><option value="visual_reference">visual_reference</option><option value="plot_template">plot_template</option></select></label>
+                <label><span>绘图语言</span><input id="proposal-language" type="text" maxlength="100" placeholder="R / Python / Julia / Matlab / none" /></label>
+                <label><span>Plot family</span><input id="proposal-family" type="text" maxlength="200" /></label>
+                <label><span>Canonical implementation</span><select id="canonical-code"><option value="">未选择</option></select></label>
+                <label class="span-2"><span>描述</span><textarea id="proposal-description" rows="3" maxlength="4000"></textarea></label>
+                <label class="span-2"><span>用户标注意图 / 备注</span><textarea id="proposal-note" rows="2" maxlength="2000" placeholder="记录拆分、组合或代码配对的判断依据"></textarea></label>
+              </div>
+              <div id="proposal-advice" class="advice-panels"></div>
+              <div class="proposal-footer">
+                <p class="muted">Server 只执行确定性操作。Rule Assessment、Agent Proposal 与 User Decision 将保持分离。</p>
+                <button id="proposal-submit" type="button">提交 Proposal 给 Host Agent</button>
+              </div>
+            </section>
+          </article>
+        </div>
+      </section>
+
+      <section id="view-review" class="mode-view" role="tabpanel" aria-labelledby="tab-review" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">PUBLISHED REMAINS LIVE</p>
+            <h2>Working Revision 审核</h2>
+            <p class="muted">Published Head 保持可搜索；Working 只在审核工作台可见。</p>
+          </div>
+        </div>
+
+        <form id="review-form" class="action-bar">
+          <label class="grow-field"><span>Template ID（留空列出所有 Working）</span><input id="review-template-id" type="text" autocomplete="off" placeholder="user-..." /></label>
+          <button id="review-open" type="submit">打开 Review</button>
+          <button id="review-history-refresh" class="secondary" type="button">刷新 History</button>
+          <button id="review-diff-refresh" class="secondary" type="button">刷新 Diff</button>
+        </form>
+
+        <div id="review-series-list" class="series-list"></div>
+        <div id="review-empty" class="empty">输入 Template ID，或加载当前所有 Working Revision。</div>
+        <article id="review-workbench" class="review-workbench" hidden>
+          <div class="workbench-heading">
+            <div>
+              <p class="status-pill">TEMPLATE SERIES</p>
+              <h3 id="review-title">Template review</h3>
+              <code id="review-id" class="copy-id"></code>
+            </div>
+            <div class="button-row">
+              <button id="review-agent-request" class="secondary compact" type="button">交给 Agent 审核</button>
+              <button id="review-publish-request" class="compact" type="button">请求发布计划</button>
+            </div>
+          </div>
+
+          <div id="head-summary" class="head-grid"></div>
+          <div class="review-tabs" role="tablist" aria-label="Revision comparison">
+            <button class="review-tab" type="button" data-pane="published" aria-selected="true">Published</button>
+            <button class="review-tab" type="button" data-pane="working" aria-selected="false">Working</button>
+            <button class="review-tab" type="button" data-pane="diff" aria-selected="false">Diff</button>
+          </div>
+          <div id="review-pane" class="review-pane"></div>
+
+          <section class="review-section">
+            <div class="subheading"><div><h4>Validation / Gates / Warnings</h4></div><p>Validation Error 不可豁免；Blocking Gate 必须解决；Warning 非阻断但永久保留。</p></div>
+            <div id="review-findings" class="finding-columns"></div>
+          </section>
+
+          <section class="review-section">
+            <div class="subheading"><div><h4>Release History</h4></div><p>恢复历史版本会创建新的 Working candidate，不会倒退 Published 指针。</p></div>
+            <div id="release-history" class="history-list"></div>
+          </section>
+        </article>
+      </section>
+
+      <footer id="status" class="global-status" aria-live="polite" data-tone="neutral">ScientificFigureLibrary 是模板、资产与生命周期的权威来源。</footer>
     </main>
     <script type="module" src="/main.ts"></script>
   </body>
