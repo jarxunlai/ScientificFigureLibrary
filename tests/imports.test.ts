@@ -7,6 +7,7 @@ import test from "node:test";
 import { strToU8, zipSync } from "fflate";
 import { stringify } from "yaml";
 import { prepareDirectImport } from "../src/importers.ts";
+import { ensureLibraryRootMarker } from "../src/library-runtime.ts";
 import { managementReference, UserTemplateLibrary } from "../src/user-library.ts";
 
 const PNG = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -478,6 +479,55 @@ test("direct imports plan stable updates, require duplicate decisions, replay sa
     });
     assert.equal(repeatedArchive.changed, false);
     assert.equal(repeatedArchive.alreadyArchived, true);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a create replay cannot cross a Library locator context", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "figure-library-direct-context-test-"));
+  try {
+    const source = path.join(root, "source");
+    const firstRoot = path.join(root, "library-a");
+    const secondRoot = path.join(root, "library-b");
+    await fs.mkdir(source);
+    await Promise.all([
+      ensureLibraryRootMarker(firstRoot),
+      ensureLibraryRootMarker(secondRoot),
+    ]);
+    const codePath = path.join(source, "plot.R");
+    await fs.writeFile(codePath, "# library-context replay fixture\n");
+    const direct = {
+      title: "Library context replay fixture",
+      sourceKey: "manual:library-context-replay",
+      codePaths: [codePath],
+    };
+    const firstLibrary = new UserTemplateLibrary(firstRoot);
+    const secondLibrary = new UserTemplateLibrary(secondRoot);
+    const firstPlan = await firstLibrary.planDirectImport(direct);
+    const secondPlan = await secondLibrary.planDirectImport(direct);
+    assert.equal(firstPlan.action, "create");
+    assert.equal(secondPlan.action, "create");
+    assert.equal(firstPlan.proposedTemplateId, secondPlan.proposedTemplateId);
+    assert.notDeepEqual(firstPlan.libraryContext, secondPlan.libraryContext);
+
+    await secondLibrary.applyDirectImport({
+      ...direct,
+      planDigest: secondPlan.planDigest,
+      expectedAction: secondPlan.action,
+      expectedTemplateId: secondPlan.proposedTemplateId,
+      operationId: "seed-second-library",
+    });
+    await assert.rejects(
+      secondLibrary.applyDirectImport({
+        ...direct,
+        planDigest: firstPlan.planDigest,
+        expectedAction: firstPlan.action,
+        expectedTemplateId: firstPlan.proposedTemplateId,
+        operationId: "replay-plan-from-first-library",
+      }),
+      /stale import plan: create replay does not match the current library context/u,
+    );
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

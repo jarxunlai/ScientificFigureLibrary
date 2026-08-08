@@ -244,27 +244,56 @@ async function requireListableCaptureStore(store: CaptureStore) {
   return status;
 }
 
+async function bindTrustedProject(
+  store: CaptureStore,
+  input: { projectDirectory?: string },
+) {
+  await store.bindProjectDirectory(input.projectDirectory);
+}
+
 function scalarVariable(value: unknown, label: string) {
   if (typeof value !== "string" || !value) throw new Error(`invalid resource ${label}`);
   return value;
 }
 
-const CaptureIdInput = z.object({ captureId: z.string().min(1).max(200) });
+const TrustedProjectDirectorySchema = z
+  .string()
+  .min(1)
+  .max(4_000)
+  .optional()
+  .describe(
+    "Absolute project path supplied by the trusted host runtime, never by captured web content.",
+  );
+const TrustedProjectInput = {
+  projectDirectory: TrustedProjectDirectorySchema,
+};
+const CaptureOpenInput = z.object({ ...TrustedProjectInput });
+const CaptureIdInput = z.object({
+  ...TrustedProjectInput,
+  captureId: z.string().min(1).max(200),
+});
 const CaptureArticleInput = z.object({
+  ...TrustedProjectInput,
   url: z.string().url().max(4_000),
   operationId: z.string().min(1).max(128).regex(OPERATION_ID).optional(),
 });
-const CaptureListInput = z.object({ includeArchived: z.boolean().optional().default(false) });
+const CaptureListInput = z.object({
+  ...TrustedProjectInput,
+  includeArchived: z.boolean().optional().default(false),
+});
 const CaptureAssetInput = z.object({
+  ...TrustedProjectInput,
   captureId: z.string().min(1).max(200),
   assetId: z.string().min(1).max(200),
 });
 const CleanupModeSchema = z.enum(["prune_payload", "full_purge"]);
 const CleanupPlanInput = z.object({
+  ...TrustedProjectInput,
   captureId: z.string().min(1).max(200),
   mode: CleanupModeSchema,
 });
 const CleanupApplyInput = z.object({
+  ...TrustedProjectInput,
   captureId: z.string().min(1).max(200),
   mode: CleanupModeSchema,
   operationId: z.string().min(1).max(128).regex(OPERATION_ID).optional(),
@@ -313,6 +342,29 @@ const FigureCodeLinkSchema = z.object({
   evidence: z.string().min(1).max(4_000),
   confidence: z.number().min(0).max(1).optional(),
 });
+const AnnotationDraftSchema = z.object({
+  schema: z.literal("figure-library.annotation-draft.v1").optional(),
+  title: z.string().max(500).optional(),
+  description: z.string().max(8_000).optional(),
+  assetKind: z.enum(["plot_template", "visual_reference"]).optional(),
+  language: z.string().max(100).optional(),
+  plotFamily: z.string().max(200).optional(),
+  visualAssetIds: z.array(z.string().min(1).max(200)).max(100).optional().default([]),
+  primaryVisualAssetId: z.string().min(1).max(200).optional(),
+  multiImageConfirmed: z.boolean().optional().default(false),
+  codeBlockIds: z.array(z.string().min(1).max(200)).max(100).optional().default([]),
+  contextBlockIds: z.array(z.string().min(1).max(200)).max(240).optional().default([]),
+  canonicalCodeBlockId: z.string().min(1).max(200).optional(),
+  figureCodeLinks: z.array(FigureCodeLinkSchema).max(100).optional().default([]),
+  userNote: z.string().max(8_000).optional(),
+});
+const CaptureAnnotationOpenInput = z.object({
+  ...TrustedProjectInput,
+  captureId: z.string().min(1).max(200),
+  page: z.number().int().min(1).optional().default(1),
+  pageSize: z.number().int().min(1).max(4).optional().default(2),
+  annotationDraft: AnnotationDraftSchema.optional(),
+});
 const WorkingSelectionSchema = z.object({
   visualAssetIds: z.array(z.string().min(1).max(200)).min(1).max(100),
   primaryVisualAssetId: z.string().min(1).max(200),
@@ -323,6 +375,7 @@ const WorkingSelectionSchema = z.object({
   figureCodeLinks: z.array(FigureCodeLinkSchema).max(100).optional().default([]),
 });
 const WorkingPlanInput = z.object({
+  ...TrustedProjectInput,
   templateId: z.string().min(1).max(128).optional(),
   mode: z.enum(["create", "update"]),
   captureId: z.string().min(1).max(200),
@@ -342,6 +395,7 @@ const WorkingPlanInput = z.object({
   userDecision: z.record(z.string(), z.unknown()).optional(),
 });
 const WorkingApplyInput = z.object({
+  ...TrustedProjectInput,
   planDigest: z.string().regex(HASH),
   operationId: z.string().min(1).max(128).regex(OPERATION_ID),
   expectedAction: z.enum(["create_working", "update_working"]),
@@ -374,6 +428,7 @@ const GenericApplyInput = z.object({
 
 type WorkingPlanRequest = z.infer<typeof WorkingPlanInput>;
 type WorkingSelection = z.infer<typeof WorkingSelectionSchema>;
+type AnnotationDraft = z.infer<typeof AnnotationDraftSchema>;
 
 type VerificationAsset = { assetId: string; sha256: string };
 type PlanKind = PublicLifecyclePlanKind;
@@ -437,6 +492,85 @@ function uniqueIds(values: string[], label: string) {
   const result = [...new Set(values)];
   if (result.length !== values.length) throw new Error(`${label} contains duplicate IDs`);
   return result;
+}
+
+function validatedAnnotationDraft(
+  capture: CaptureRecord,
+  input?: AnnotationDraft,
+): AnnotationDraft & { schema: "figure-library.annotation-draft.v1" } {
+  const draft = AnnotationDraftSchema.parse(input ?? {});
+  const visualAssetIds = uniqueIds(draft.visualAssetIds, "annotationDraft.visualAssetIds");
+  const codeBlockIds = uniqueIds(draft.codeBlockIds, "annotationDraft.codeBlockIds");
+  const contextBlockIds = uniqueIds(draft.contextBlockIds, "annotationDraft.contextBlockIds");
+  const knownVisuals = new Set(capture.visualAssets.map((asset) => asset.assetId));
+  const knownCode = new Set(capture.codeBlocks.map((asset) => asset.blockId));
+  const knownContext = new Set(capture.context.map((asset) => asset.blockId));
+  const selectedVisuals = new Set(visualAssetIds);
+  const selectedCode = new Set(codeBlockIds);
+
+  for (const assetId of visualAssetIds) {
+    if (!knownVisuals.has(assetId)) {
+      throw new CaptureError(
+        "invalid_annotation_draft",
+        `annotationDraft references an unknown visual asset: ${assetId}`,
+      );
+    }
+  }
+  for (const blockId of codeBlockIds) {
+    if (!knownCode.has(blockId)) {
+      throw new CaptureError(
+        "invalid_annotation_draft",
+        `annotationDraft references an unknown code block: ${blockId}`,
+      );
+    }
+  }
+  for (const blockId of contextBlockIds) {
+    if (!knownContext.has(blockId)) {
+      throw new CaptureError(
+        "invalid_annotation_draft",
+        `annotationDraft references an unknown context block: ${blockId}`,
+      );
+    }
+  }
+  if (draft.primaryVisualAssetId && !selectedVisuals.has(draft.primaryVisualAssetId)) {
+    throw new CaptureError(
+      "invalid_annotation_draft",
+      "annotationDraft.primaryVisualAssetId must be one of visualAssetIds",
+    );
+  }
+  if (draft.canonicalCodeBlockId && !selectedCode.has(draft.canonicalCodeBlockId)) {
+    throw new CaptureError(
+      "invalid_annotation_draft",
+      "annotationDraft.canonicalCodeBlockId must be one of codeBlockIds",
+    );
+  }
+  const figureCodeLinks = draft.figureCodeLinks.map((link) => {
+    if (!selectedVisuals.has(link.visualAssetId)) {
+      throw new CaptureError(
+        "invalid_annotation_draft",
+        `annotationDraft link references an unselected visual asset: ${link.visualAssetId}`,
+      );
+    }
+    const linkedCode = uniqueIds(link.codeBlockIds, "annotationDraft.figureCodeLinks.codeBlockIds");
+    for (const blockId of linkedCode) {
+      if (!selectedCode.has(blockId)) {
+        throw new CaptureError(
+          "invalid_annotation_draft",
+          `annotationDraft link references an unselected code block: ${blockId}`,
+        );
+      }
+    }
+    return { ...link, codeBlockIds: linkedCode };
+  });
+
+  return {
+    ...draft,
+    schema: "figure-library.annotation-draft.v1",
+    visualAssetIds,
+    codeBlockIds,
+    contextBlockIds,
+    figureCodeLinks,
+  };
 }
 
 function extensionFromStoredFile(file: string) {
@@ -806,7 +940,7 @@ export function registerCaptureVersionTools(options: {
     {
       title: "Open Capture and Annotation Workbench",
       description: "Open the isolated raw Capture store without affecting template search.",
-      inputSchema: {},
+      inputSchema: CaptureOpenInput.shape,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -815,23 +949,28 @@ export function registerCaptureVersionTools(options: {
       },
       _meta: { ui: { resourceUri, visibility: ["model", "app"] } },
     },
-    async (): Promise<CallToolResult> => {
-      const status = await captureStore.status();
-      return {
-        content: [
-          {
-            type: "text",
-            text: status.configured
-              ? `Capture Workbench ready; ${status.available ? "directory available" : status.reason ?? "directory unavailable"}.`
-              : `Capture is not configured. ${status.reason ?? "Library functions remain available."}`,
+    async (input): Promise<CallToolResult> => {
+      try {
+        await bindTrustedProject(captureStore, input);
+        const status = await captureStore.status();
+        return {
+          content: [
+            {
+              type: "text",
+              text: status.configured
+                ? `Capture Workbench ready; ${status.available ? "directory available" : status.reason ?? "directory unavailable"}.`
+                : `Capture is not configured. ${status.reason ?? "Library functions remain available."}`,
+            },
+          ],
+          structuredContent: {
+            view: "capture",
+            captureStatus: captureStatusForUi(status),
+            captures: await captureNavigation(captureStore),
           },
-        ],
-        structuredContent: {
-          view: "capture",
-          captureStatus: captureStatusForUi(status),
-          captures: await captureNavigation(captureStore),
-        },
-      };
+        };
+      } catch (error) {
+        return errorResult("Capture Workbench open failed", error);
+      }
     },
   );
 
@@ -853,7 +992,9 @@ export function registerCaptureVersionTools(options: {
     },
     async (input, extra): Promise<CallToolResult> => {
       try {
-        const capture = await captureStore.captureArticle({ ...input, signal: extra.signal });
+        await bindTrustedProject(captureStore, input);
+        const { projectDirectory: _projectDirectory, ...request } = input;
+        const capture = await captureStore.captureArticle({ ...request, signal: extra.signal });
         const status = await captureStore.status();
         return {
           content: [
@@ -891,6 +1032,7 @@ export function registerCaptureVersionTools(options: {
     },
     async (input): Promise<CallToolResult> => {
       try {
+        await bindTrustedProject(captureStore, input);
         const status = await requireListableCaptureStore(captureStore);
         const captures = await captureNavigation(captureStore, input.includeArchived);
         return {
@@ -922,8 +1064,10 @@ export function registerCaptureVersionTools(options: {
       },
       _meta: { ui: { resourceUri, visibility: ["model", "app"] } },
     },
-    async ({ captureId }): Promise<CallToolResult> => {
+    async (input): Promise<CallToolResult> => {
       try {
+        await bindTrustedProject(captureStore, input);
+        const { captureId } = input;
         await requireReadableCaptureStore(captureStore);
         const capture = await captureStore.get(captureId);
         if (!capture) throw new CaptureError("capture_not_found", `unknown capture: ${captureId}`);
@@ -933,6 +1077,92 @@ export function registerCaptureVersionTools(options: {
         };
       } catch (error) {
         return errorResult("Capture read failed", error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "figure_capture_annotation_open",
+    {
+      title: "Open a Capture annotation page",
+      description:
+        "Host-neutral Annotation fallback. Returns a bounded page of verified standard MCP image blocks, Capture metadata, and a validated non-persisted draft echo without requiring App UI or dynamic resources.",
+      inputSchema: CaptureAnnotationOpenInput.shape,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      _meta: { ui: { visibility: ["model", "app"] } },
+    },
+    async (input): Promise<CallToolResult> => {
+      try {
+        await bindTrustedProject(captureStore, input);
+        await requireReadableCaptureStore(captureStore);
+        const capture = await captureStore.get(input.captureId);
+        if (!capture) {
+          throw new CaptureError("capture_not_found", `unknown capture: ${input.captureId}`);
+        }
+        const draft = validatedAnnotationDraft(capture, input.annotationDraft);
+        const totalItems = capture.visualAssets.length;
+        const pageCount = totalItems ? Math.ceil(totalItems / input.pageSize) : 0;
+        if (totalItems && input.page > pageCount) {
+          throw new CaptureError(
+            "annotation_page_out_of_range",
+            `annotation page ${input.page} exceeds the ${pageCount} available pages`,
+          );
+        }
+        const start = (input.page - 1) * input.pageSize;
+        const selected = capture.visualAssets.slice(start, start + input.pageSize);
+        const verified = await Promise.all(
+          selected.map((asset) => readVerifiedVisual(captureStore, capture.captureId, asset.assetId)),
+        );
+        const content: CallToolResult["content"] = [
+          {
+            type: "text",
+            text:
+              `Annotation page ${totalItems ? input.page : 0}/${pageCount} for ${capture.captureId}; ` +
+              `${selected.length} of ${totalItems} verified images returned. ` +
+              "annotationDraft is validated and echoed only; it was not persisted.",
+          },
+        ];
+        for (const [index, item] of verified.entries()) {
+          const asset = selected[index]!;
+          content.push({
+            type: "text",
+            text: `Capture image ${start + index + 1}/${totalItems}: ${asset.assetId}; SHA-256 ${asset.sha256}`,
+          });
+          content.push({
+            type: "image",
+            data: Buffer.from(item.bytes).toString("base64"),
+            mimeType: item.mimeType,
+          });
+        }
+        return {
+          content,
+          structuredContent: {
+            view: "capture-annotation",
+            capture: presentCapture(capture),
+            imagePage: {
+              page: totalItems ? input.page : 0,
+              pageSize: input.pageSize,
+              pageCount,
+              totalItems,
+              itemAssetIds: selected.map((asset) => asset.assetId),
+              hasPreviousPage: totalItems > 0 && input.page > 1,
+              hasNextPage: totalItems > 0 && input.page < pageCount,
+              ...(totalItems > 0 && input.page > 1 ? { previousPage: input.page - 1 } : {}),
+              ...(totalItems > 0 && input.page < pageCount ? { nextPage: input.page + 1 } : {}),
+              maximumPageSize: 4,
+            },
+            annotationDraft: draft,
+            draftPersisted: false,
+            security: untrustedWebSecurity(),
+          },
+        };
+      } catch (error) {
+        return errorResult("Capture annotation open failed", error);
       }
     },
   );
@@ -951,8 +1181,10 @@ export function registerCaptureVersionTools(options: {
       },
       _meta: { ui: { visibility: ["model", "app"] } },
     },
-    async ({ captureId, assetId }): Promise<CallToolResult> => {
+    async (input): Promise<CallToolResult> => {
       try {
+        await bindTrustedProject(captureStore, input);
+        const { captureId, assetId } = input;
         await requireReadableCaptureStore(captureStore);
         const { asset, bytes, mimeType } = await readVerifiedVisual(
           captureStore,
@@ -1005,8 +1237,10 @@ export function registerCaptureVersionTools(options: {
         },
         _meta: { ui: { resourceUri, visibility: ["model", "app"] } },
       },
-      async ({ captureId }): Promise<CallToolResult> => {
+      async (input): Promise<CallToolResult> => {
         try {
+          await bindTrustedProject(captureStore, input);
+          const { captureId } = input;
           const capture =
             action === "archive"
               ? await captureStore.archive(captureId)
@@ -1039,9 +1273,14 @@ export function registerCaptureVersionTools(options: {
     },
     async (input): Promise<CallToolResult> => {
       try {
+        await bindTrustedProject(captureStore, input);
         await requireReadableCaptureStore(captureStore);
         const receipts = await versionedLibrary.listCaptureReceipts(input.captureId);
-        const plan = await captureStore.planCleanup({ ...input, durableReceipts: receipts });
+        const plan = await captureStore.planCleanup({
+          captureId: input.captureId,
+          mode: input.mode,
+          durableReceipts: receipts,
+        });
         return {
           content: [
             {
@@ -1061,7 +1300,7 @@ export function registerCaptureVersionTools(options: {
     "figure_capture_apply_cleanup",
     {
       title: "Apply Capture cleanup (disabled)",
-      description: "Reserved cleanup Apply interface. v0.4.1 always returns cleanup_not_enabled.",
+      description: "Reserved cleanup Apply interface. v0.4.2 always returns cleanup_not_enabled.",
       inputSchema: CleanupApplyInput.shape,
       annotations: {
         readOnlyHint: false,
@@ -1072,7 +1311,9 @@ export function registerCaptureVersionTools(options: {
     },
     async (input): Promise<CallToolResult> => {
       try {
-        await captureStore.applyCleanup(input);
+        await bindTrustedProject(captureStore, input);
+        const { projectDirectory: _projectDirectory, ...request } = input;
+        await captureStore.applyCleanup(request);
         throw new Error("cleanup Apply unexpectedly returned");
       } catch (error) {
         return errorResult("Capture cleanup was not applied", error);
@@ -1245,6 +1486,7 @@ export function registerCaptureVersionTools(options: {
     },
     async (input): Promise<CallToolResult> => {
       try {
+        await bindTrustedProject(captureStore, input);
         const prepared = await buildCaptureCandidate(captureStore, input);
         const backendPlan =
           input.mode === "create"
@@ -1258,13 +1500,14 @@ export function registerCaptureVersionTools(options: {
                 candidate: prepared.candidate,
                 assessment: input.assessment as ReviewAssessmentInput | undefined,
               });
+        const { projectDirectory: _projectDirectory, ...portableRequest } = input;
         const digestPayload = {
           schema: "figure-library.public-lifecycle-plan-digest.v1",
           kind: "working",
           action: backendPlan.action,
           templateId: backendPlan.templateId,
           expectedSeriesDigest: backendPlan.expectedSeriesDigest,
-          request: input,
+          request: portableRequest,
           captureId: prepared.capture.captureId,
           captureDigest: prepared.capture.captureDigest,
           selectionDigest: prepared.selectionDigest,
@@ -1313,6 +1556,7 @@ export function registerCaptureVersionTools(options: {
     },
     async (input): Promise<CallToolResult> => {
       try {
+        await bindTrustedProject(captureStore, input);
         const entry = plans.get(input.planDigest);
         if (!entry) {
           const result = await replayCompletedPublicOperation({

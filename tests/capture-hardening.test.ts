@@ -144,6 +144,89 @@ test("verifiedAssetSource returns the already hash-checked stored file while pub
   }
 });
 
+test("raw, visual, code, and context assets reject parent-directory symlink escapes", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "figure-capture-asset-parent-symlink-"));
+  try {
+    const html = await fs.readFile(
+      path.join(import.meta.dirname, "fixtures", "wechat-article.html"),
+      "utf8",
+    );
+    const store = new CaptureStore(
+      path.join(root, "capture"),
+      async (input) =>
+        input.toString().startsWith("https://mp.weixin.qq.com/")
+          ? new Response(html, {
+              status: 200,
+              headers: { "content-type": "text/html; charset=utf-8" },
+            })
+          : new Response(PNG, {
+              status: 200,
+              headers: { "content-type": "image/png" },
+            }),
+      PUBLIC_RESOLVER,
+    );
+    const capture = await store.captureArticle({
+      url: "https://mp.weixin.qq.com/s/asset-parent-symlink",
+    });
+    const visual = capture.visualAssets[0];
+    const code = capture.codeBlocks[0];
+    const context = capture.context[0];
+    assert.ok(visual && code && context, "fixture did not produce every Capture asset class");
+
+    const candidates = [
+      { kind: "raw", assetId: capture.rawPayload.assetId, asset: capture.rawPayload },
+      { kind: "visual", assetId: visual.assetId, asset: visual },
+      { kind: "code", assetId: code.blockId, asset: code },
+      { kind: "context", assetId: context.blockId, asset: context },
+    ];
+    const recordDirectory = path.join(root, "capture", "captures", capture.captureId);
+
+    for (const candidate of candidates) {
+      const sourcePath = path.join(recordDirectory, ...candidate.asset.file.split("/"));
+      const parentDirectory = path.dirname(sourcePath);
+      const backupDirectory = `${parentDirectory}.symlink-test-backup-${candidate.kind}`;
+      const externalDirectory = path.join(root, `outside-record-${candidate.kind}`);
+      const originalBytes = new Uint8Array(await fs.readFile(sourcePath));
+      assert.equal(originalBytes.byteLength, candidate.asset.bytes);
+      assert.equal(digest(originalBytes), candidate.asset.sha256);
+
+      let parentMoved = false;
+      let symlinkCreated = false;
+      try {
+        await fs.rename(parentDirectory, backupDirectory);
+        parentMoved = true;
+        await fs.mkdir(externalDirectory);
+        const externalFile = path.join(externalDirectory, path.basename(sourcePath));
+        await fs.writeFile(externalFile, originalBytes);
+        const externalBytes = new Uint8Array(await fs.readFile(externalFile));
+        assert.equal(externalBytes.byteLength, candidate.asset.bytes);
+        assert.equal(digest(externalBytes), candidate.asset.sha256);
+        await fs.symlink(
+          externalDirectory,
+          parentDirectory,
+          process.platform === "win32" ? "junction" : "dir",
+        );
+        symlinkCreated = true;
+
+        await assert.rejects(
+          store.readAsset(capture.captureId, candidate.assetId),
+          errorCode("capture_asset_path_escape"),
+          `${candidate.kind} asset followed a parent-directory symlink outside its Capture record`,
+        );
+      } finally {
+        if (symlinkCreated) await fs.unlink(parentDirectory);
+        if (parentMoved) await fs.rename(backupDirectory, parentDirectory);
+      }
+
+      const restored = await store.readAsset(capture.captureId, candidate.assetId);
+      assert.equal(restored.bytes.byteLength, candidate.asset.bytes);
+      assert.equal(digest(restored.bytes), candidate.asset.sha256);
+    }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("resolved loopback, private, link-local, metadata, and non-global IPv6 targets never reach transport", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "figure-capture-non-public-"));
   try {
@@ -214,23 +297,30 @@ test("response body timeout cancels a stalled stream and stores no partial Captu
   }
 });
 
-test("one total deadline stops a sequence of slow images and late transports cannot write", async () => {
+test("one monotonic total deadline ignores wall-clock jumps and stops late writes", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "figure-capture-total-deadline-"));
+  const originalDateNow = Date.now;
   try {
     const images = Array.from(
-      { length: 8 },
+      { length: 20 },
       (_item, index) => `<img src="https://asset.example.test/slow-${index}.png">`,
     ).join("");
     const html = `<!doctype html><html><article><p>Context.</p>${images}</article></html>`;
     let imageRequests = 0;
+    let wallClockJumped = false;
     const transport: CaptureRequestTransport = async ({ url }) => {
       if (url.hostname === "article.example.test") {
         return new Response(html, { headers: { "content-type": "text/html" } });
       }
       imageRequests += 1;
+      if (!wallClockJumped) {
+        const jumpedTo = originalDateNow() + 24 * 60 * 60 * 1_000;
+        Date.now = () => jumpedTo;
+        wallClockJumped = true;
+      }
       // Deliberately ignore requestOptions.signal: the capture-wide race must still stop the
       // pipeline, and this late response must never resume iteration or reach durable storage.
-      await new Promise((resolve) => setTimeout(resolve, 45));
+      await new Promise((resolve) => setTimeout(resolve, 120));
       return new Response(PNG, { headers: { "content-type": "image/png" } });
     };
     const store = new CaptureStore(
@@ -239,9 +329,9 @@ test("one total deadline stops a sequence of slow images and late transports can
       PUBLIC_RESOLVER,
       transport,
       1_000,
-      115,
+      900,
     );
-    const startedAt = Date.now();
+    const startedAt = performance.now();
     await assert.rejects(
       store.captureArticle({
         url: "https://article.example.test/many-slow-images",
@@ -249,14 +339,15 @@ test("one total deadline stops a sequence of slow images and late transports can
       }),
       errorCode("capture_deadline_exceeded"),
     );
-    const elapsed = Date.now() - startedAt;
-    assert.ok(elapsed < 500, `total deadline was not enforced promptly (${elapsed} ms)`);
+    const elapsed = performance.now() - startedAt;
+    assert.ok(elapsed < 2_500, `total deadline was not enforced promptly (${elapsed} ms)`);
+    assert.equal(wallClockJumped, true, "fixture did not simulate a forward wall-clock jump");
     assert.ok(imageRequests >= 2, "fixture did not exercise a sequence of image requests");
-    assert.ok(imageRequests < 8, "capture continued starting images after its total deadline");
+    assert.ok(imageRequests < 20, "capture continued starting images after its total deadline");
     const requestsAtFailure = imageRequests;
 
     assert.deepEqual(await store.list({ includeArchived: true }), []);
-    await new Promise((resolve) => setTimeout(resolve, 160));
+    await new Promise((resolve) => setTimeout(resolve, 300));
     assert.equal(imageRequests, requestsAtFailure, "a late transport resumed the image loop");
     assert.deepEqual(await store.list({ includeArchived: true }), []);
     assert.deepEqual(
@@ -265,6 +356,7 @@ test("one total deadline stops a sequence of slow images and late transports can
       "deadline failure left an operation receipt or temporary operation file",
     );
   } finally {
+    Date.now = originalDateNow;
     await fs.rm(root, { recursive: true, force: true });
   }
 });

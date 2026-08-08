@@ -6,6 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  applyLibraryWriteLockRecovery,
+  planLibraryWriteLockRecovery,
+} from "../src/cross-runtime-lock.ts";
+import { readLibraryRootMarker } from "../src/library-runtime.ts";
+import {
   VersionedTemplateLibrary,
   type LifecycleFaultPoint,
   type VersionedTemplateCandidate,
@@ -107,8 +112,9 @@ test("a public publish recovers after the Series pointer moved but its receipt w
       true,
     );
 
-    // Model the lock directory left by a hard process exit. A new process may
-    // remove it only after confirming that the recorded PID no longer exists.
+    // Model a lock directory left by a hard process exit. Cross-runtime PIDs are
+    // not authoritative, so replay must fail until the user explicitly applies
+    // a lock-recovery plan.
     const deadPid = await exitedChildPid();
     const lock = path.join(root, ".write-lock");
     await fs.mkdir(lock);
@@ -118,6 +124,32 @@ test("a public publish recovers after the Series pointer moved but its receipt w
     );
 
     const restarted = new VersionedTemplateLibrary(root);
+    await assert.rejects(
+      restarted.replayPublicOperation({
+        kind: "publish",
+        planDigest: publicDigest,
+        operationId,
+        expectedTemplateId: "publish-crash",
+        expectedSeriesDigest: publish.expectedSeriesDigest,
+        expectedAction: "publish",
+      }),
+      /library_busy/u,
+    );
+    assert.equal(await fs.access(lock).then(() => true), true);
+    const marker = await readLibraryRootMarker(root);
+    assert.ok(marker);
+    const recoveryPlan = await planLibraryWriteLockRecovery({
+      libraryRoot: root,
+      libraryId: marker.value.libraryId,
+      reason: "The user confirmed that the crashed writer has stopped.",
+    });
+    const lockRecovery = await applyLibraryWriteLockRecovery(
+      recoveryPlan,
+      "recover-publish-crash-lock",
+    );
+    assert.equal(lockRecovery.idempotentReplay, false);
+    assert.equal((await fs.stat(lockRecovery.archiveDirectory)).isDirectory(), true);
+
     const recovered = await restarted.replayPublicOperation({
       kind: "publish",
       planDigest: publicDigest,
@@ -617,7 +649,7 @@ test("a live or corrupt write lock is never removed automatically", async () => 
       path.join(lock, "owner.json"),
       `${JSON.stringify({ operation: "live-writer", pid: process.pid, token: "live-owner", createdAt: new Date().toISOString() })}\n`,
     );
-    await assert.rejects(library.applyCreateWorking(plan, "blocked-by-live-writer"), /live writer/u);
+    await assert.rejects(library.applyCreateWorking(plan, "blocked-by-live-writer"), /library_busy/u);
     assert.equal(await fs.access(lock).then(() => true), true);
 
     await fs.rm(lock, { recursive: true, force: true });
@@ -625,7 +657,7 @@ test("a live or corrupt write lock is never removed automatically", async () => 
     await fs.writeFile(path.join(lock, "owner.json"), "{\"pid\":\"not-an-integer\"}\n");
     await assert.rejects(
       library.applyCreateWorking(plan, "blocked-by-corrupt-lock"),
-      /manual recovery required/u,
+      /library_busy/u,
     );
     assert.equal(await fs.access(lock).then(() => true), true);
   } finally {

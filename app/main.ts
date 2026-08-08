@@ -141,7 +141,7 @@ const releaseHistory = byId<HTMLElement>("release-history");
 const reviewAgentRequest = byId<HTMLButtonElement>("review-agent-request");
 const reviewPublishRequest = byId<HTMLButtonElement>("review-publish-request");
 
-const app = new App({ name: "Scientific Figure Library", version: "0.4.1" });
+const app = new App({ name: "Scientific Figure Library", version: "0.4.2" });
 let connected = false;
 let serverToolsDenied = false;
 let currentMode: Mode = "search";
@@ -408,7 +408,7 @@ function setMode(mode: Mode, load = false) {
   });
   const labels: Record<Mode, [string, string]> = {
     search: ["科学图表工作台", "普通搜索只展示当前 Published 模板。"],
-    capture: ["Capture / Annotation", "Raw Capture 与模板库隔离，Annotation Proposal 不会直接发布。"],
+    capture: ["Capture / Annotation", "当前项目 Raw Capture 与全局模板库隔离，Annotation Proposal 不会直接发布。"],
     review: ["Working Revision Review", "对比 Published 与 Working，并显式处理 Review Gates。"],
   };
   [pageTitle.textContent, pageSummary.textContent] = labels[mode];
@@ -500,7 +500,7 @@ function renderSearch(value: LooseRecord) {
   const source = firstRecord(value.search, value.result) ?? value;
   const candidates = recordArray(source.candidates).map(normalizeCandidate);
   const searchQuery = firstString(source.query, "等待绘图目标");
-  const version = firstString(source.libraryVersion, "0.4.1");
+  const version = firstString(source.libraryVersion, "0.4.2");
   queryLabel.textContent = `“${searchQuery}” · v${version}`;
   searchCards.replaceChildren();
   searchEmpty.hidden = candidates.length > 0;
@@ -640,7 +640,7 @@ function renderCaptureStatus(value: LooseRecord) {
   const retention = firstString(status.retention, "manual / no automatic cleanup");
   if (!directory && !("configured" in status) && !("captureDirectoryConfigured" in status)) return;
   captureStatus.replaceChildren(
-    statusTile("FIGURE_CAPTURE_DIR", directory || (configured ? "configured" : "not configured")),
+    statusTile("Project Capture", directory || (configured ? "configured" : "not configured")),
     statusTile("Path source", source || "unset"),
     statusTile("Availability", `${configured ? "configured" : "disabled"} · ${accessible ? "accessible" : "unavailable"} · ${writable ? "writable" : "read-only"}`),
     statusTile("Retention", retention),

@@ -1,7 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { withCrossRuntimeWriteLock } from "./cross-runtime-lock.ts";
+import {
+  assertLibraryOperationContext,
+  assertNoPortableCaseCollision,
+  assertPortableFilesystemSegment,
+  assertPortableSegment,
+  ensureLibraryRootMarker,
+  operationContextForSnapshot,
+  portableCaseFold,
+  resolveLibraryRuntimeSnapshotSync,
+  type LibraryDirectorySource,
+  type LibraryOperationContext,
+  type LibraryRuntimeSnapshot,
+} from "./library-runtime.ts";
 
 export const TEMPLATE_SERIES_SCHEMA = "figure-library.template-series.v1" as const;
 export const TEMPLATE_CONTENT_SCHEMA = "figure-library.template-content.v1" as const;
@@ -323,6 +336,7 @@ interface PlanBase {
   action: LifecyclePlanAction;
   templateId: string;
   expectedSeriesDigest: string | null;
+  libraryContext?: LibraryOperationContext;
   createdAt: string;
   planDigest: string;
 }
@@ -399,6 +413,7 @@ export interface LifecycleOperationReceiptV1 {
   action: LifecyclePlanAction;
   templateId: string;
   appliedAt: string;
+  libraryContext?: LibraryOperationContext;
   publicPlan?: PublicLifecycleOperationBinding;
   result: Omit<LifecycleApplyResult, "idempotentReplay">;
 }
@@ -410,6 +425,7 @@ export interface LifecycleOperationIntentV1 {
   action: LifecyclePlanAction;
   templateId: string;
   expectedSeriesDigest: string | null;
+  libraryContext?: LibraryOperationContext;
   expectedSeries: TemplateSeriesV1 | null;
   preparedAt: string;
   publicPlan?: PublicLifecycleOperationBinding;
@@ -493,7 +509,16 @@ function jsonClone<T extends JsonValue>(value: T): T {
 
 function assertSafeSegment(value: string, label: string) {
   if (!SAFE_SEGMENT.test(value)) throw new Error(`unsafe ${label}: ${value}`);
-  return value;
+  return assertPortableSegment(value, label);
+}
+
+function isSafeSegment(value: string) {
+  try {
+    assertSafeSegment(value, "path segment");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function validateRevisionAssetPath(value: string) {
@@ -520,6 +545,7 @@ export function validateRevisionAssetPath(value: string) {
   ) {
     throw new Error(`unsafe revision asset path: ${value}`);
   }
+  for (const segment of segments) assertPortableFilesystemSegment(segment, "revision asset path segment");
   return segments.join("/");
 }
 
@@ -767,7 +793,7 @@ async function prepareCandidate(options: {
       throw new Error(`invalid revision asset role: ${String(input.role)}`);
     }
     const logicalPath = validateRevisionAssetPath(input.logicalPath);
-    const folded = logicalPath.toLocaleLowerCase();
+    const folded = portableCaseFold(logicalPath);
     if (logicalPaths.has(logicalPath) || caseFoldedPaths.has(folded)) {
       throw new Error(`duplicate revision asset path: ${logicalPath}`);
     }
@@ -1146,7 +1172,11 @@ async function immutableWriteJson(file: string, value: unknown) {
 
 export interface VersionedLibraryStatus {
   root: string;
-  directorySource: "argument" | "FIGURE_LIBRARY_DIR" | "default";
+  directorySource: LibraryDirectorySource;
+  libraryId?: string;
+  configRevision: number | null;
+  writesEnabled: boolean;
+  legacyDefault: boolean;
   exists: boolean;
   readable: boolean;
   writable: boolean;
@@ -1263,6 +1293,22 @@ function assertStringArray(value: unknown, label: string): asserts value is stri
   }
 }
 
+function validateLibraryOperationContextValue(value: unknown): LibraryOperationContext {
+  if (!isRecord(value) || typeof value.libraryId !== "string" || !value.libraryId) {
+    throw new Error("invalid lifecycle library context");
+  }
+  if (
+    value.configRevision !== null &&
+    (!Number.isSafeInteger(value.configRevision) || (value.configRevision as number) < 1)
+  ) {
+    throw new Error("invalid lifecycle library configRevision");
+  }
+  return {
+    libraryId: value.libraryId,
+    configRevision: value.configRevision as number | null,
+  };
+}
+
 function validateStoredAsset(value: unknown): StoredRevisionAsset {
   if (!isRecord(value)) throw new Error("invalid stored revision asset");
   assertString(value.logicalPath, "stored asset logicalPath");
@@ -1327,7 +1373,7 @@ function validateContentValue(
   const folded = new Set<string>();
   let totalBytes = 0;
   for (const asset of assets) {
-    const lower = asset.logicalPath.toLocaleLowerCase();
+    const lower = portableCaseFold(asset.logicalPath);
     if (paths.has(asset.logicalPath) || folded.has(lower)) {
       throw new Error(`duplicate stored asset path: ${asset.logicalPath}`);
     }
@@ -1610,14 +1656,23 @@ export class VersionedTemplateLibrary {
   readonly operationIntentsDirectory: string;
   readonly captureReceiptsDirectory: string;
   readonly writeLockDirectory: string;
-  readonly directorySource: "argument" | "FIGURE_LIBRARY_DIR" | "default";
+  readonly directorySource: LibraryDirectorySource;
+  readonly configRevision: number | null;
+  readonly writesEnabled: boolean;
+  readonly runtimeContext?: LibraryOperationContext;
   private readonly faultInjector?: VersionedTemplateLibraryOptions["faultInjector"];
+  private libraryId?: string;
 
-  constructor(root?: string, options: VersionedTemplateLibraryOptions = {}) {
-    const environmentRoot = process.env.FIGURE_LIBRARY_DIR?.trim() || undefined;
-    const selected = root ?? environmentRoot ?? path.join(os.homedir(), ".figure-library");
-    this.directorySource = root ? "argument" : environmentRoot ? "FIGURE_LIBRARY_DIR" : "default";
-    this.root = path.resolve(selected);
+  constructor(
+    root?: string | LibraryRuntimeSnapshot,
+    options: VersionedTemplateLibraryOptions = {},
+  ) {
+    const selected =
+      typeof root === "string"
+        ? resolveLibraryRuntimeSnapshotSync({ root })
+        : root ?? resolveLibraryRuntimeSnapshotSync();
+    this.directorySource = selected.directorySource;
+    this.root = path.resolve(selected.root);
     this.storeDirectory = path.join(this.root, "store");
     this.templatesDirectory = path.join(this.storeDirectory, "templates");
     this.legacyTemplatesDirectory = path.join(this.root, "templates");
@@ -1625,6 +1680,10 @@ export class VersionedTemplateLibrary {
     this.operationIntentsDirectory = path.join(this.storeDirectory, "operation-intents");
     this.captureReceiptsDirectory = path.join(this.storeDirectory, "receipts", "capture-materializations");
     this.writeLockDirectory = path.join(this.root, ".write-lock");
+    this.configRevision = selected.configRevision;
+    this.writesEnabled = selected.writesEnabled;
+    this.libraryId = selected.libraryId;
+    this.runtimeContext = operationContextForSnapshot(selected);
     this.faultInjector = options.faultInjector;
   }
 
@@ -1634,6 +1693,30 @@ export class VersionedTemplateLibrary {
 
   private legacyTemplateDirectory(templateId: string) {
     return path.join(this.legacyTemplatesDirectory, assertSafeSegment(templateId, "templateId"));
+  }
+
+  private async assertNoTemplateIdCaseCollision(templateId: string) {
+    const folded = portableCaseFold(assertSafeSegment(templateId, "templateId"));
+    for (const directory of [this.templatesDirectory, this.legacyTemplatesDirectory]) {
+      let entries: import("node:fs").Dirent[];
+      try {
+        entries = await fs.readdir(directory, { withFileTypes: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      const collision = entries.find(
+        (entry) =>
+          entry.isDirectory() &&
+          entry.name !== templateId &&
+          portableCaseFold(entry.name) === folded,
+      );
+      if (collision) {
+        throw new Error(
+          `portable case-fold collision for templateId: ${collision.name}, ${templateId}`,
+        );
+      }
+    }
   }
 
   private seriesFile(templateId: string) {
@@ -1687,87 +1770,22 @@ export class VersionedTemplateLibrary {
   }
 
   private async withWriteLock<T>(operation: string, callback: () => Promise<T>) {
-    await fs.mkdir(this.root, { recursive: true });
-    const owner = {
-      operation,
-      pid: process.pid,
-      token: randomUUID(),
-      createdAt: nowIso(),
-    };
-    for (;;) {
-      try {
-        await fs.mkdir(this.writeLockDirectory);
-        try {
-          await fs.writeFile(
-            path.join(this.writeLockDirectory, "owner.json"),
-            `${JSON.stringify(owner, null, 2)}\n`,
-            { flag: "wx" },
-          );
-        } catch (error) {
-          await fs.rm(this.writeLockDirectory, { recursive: true, force: true });
-          throw error;
-        }
-        break;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        let priorOwner: unknown;
-        try {
-          priorOwner = await readJson(path.join(this.writeLockDirectory, "owner.json"));
-        } catch {
-          throw new Error(
-            "figure library is write-locked; the lock owner is missing or corrupt and requires manual recovery",
-          );
-        }
-        if (
-          !isRecord(priorOwner) ||
-          typeof priorOwner.operation !== "string" ||
-          !priorOwner.operation ||
-          !Number.isSafeInteger(priorOwner.pid) ||
-          (priorOwner.pid as number) <= 0 ||
-          typeof priorOwner.token !== "string" ||
-          !priorOwner.token ||
-          typeof priorOwner.createdAt !== "string" ||
-          Number.isNaN(Date.parse(priorOwner.createdAt))
-        ) {
-          throw new Error(
-            `figure library is write-locked; manual recovery required: ${canonicalJson(priorOwner)}`,
-          );
-        }
-        let ownerAlive = true;
-        try {
-          process.kill(priorOwner.pid as number, 0);
-        } catch (probeError) {
-          const code = (probeError as NodeJS.ErrnoException).code;
-          if (code === "ESRCH") ownerAlive = false;
-          else if (code !== "EPERM") throw probeError;
-        }
-        if (ownerAlive) {
-          throw new Error(
-            `figure library is write-locked by a live writer: ${canonicalJson(priorOwner)}`,
-          );
-        }
-        const stale = `${this.writeLockDirectory}.stale.${randomUUID()}`;
-        try {
-          await fs.rename(this.writeLockDirectory, stale);
-        } catch (renameError) {
-          if ((renameError as NodeJS.ErrnoException).code === "ENOENT") continue;
-          throw renameError;
-        }
-        await fs.rm(stale, { recursive: true, force: true });
-      }
+    if (!this.writesEnabled) {
+      throw new Error(
+        "library_not_bound: the legacy ~/.figure-library default is read-only until the global library is explicitly bound",
+      );
     }
-    try {
-      return await callback();
-    } finally {
-      try {
-        const currentOwner = await readJson(path.join(this.writeLockDirectory, "owner.json"));
-        if (isRecord(currentOwner) && currentOwner.token === owner.token) {
-          await fs.rm(this.writeLockDirectory, { recursive: true, force: true });
-        }
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-    }
+    const marker = await ensureLibraryRootMarker(this.root, this.libraryId);
+    this.libraryId = marker.value.libraryId;
+    return withCrossRuntimeWriteLock(
+      {
+        root: this.root,
+        lockDirectory: this.writeLockDirectory,
+        libraryId: marker.value.libraryId,
+        operation: `versioned-library:${operation}`,
+      },
+      callback,
+    );
   }
 
   async status(): Promise<VersionedLibraryStatus> {
@@ -1790,6 +1808,10 @@ export class VersionedTemplateLibrary {
     return {
       root: this.root,
       directorySource: this.directorySource,
+      ...(this.libraryId ? { libraryId: this.libraryId } : {}),
+      configRevision: this.configRevision,
+      writesEnabled: this.writesEnabled,
+      legacyDefault: this.directorySource === "legacy-default",
       exists: rootExists,
       readable,
       writable,
@@ -1818,8 +1840,11 @@ export class VersionedTemplateLibrary {
       throw error;
     }
     const result: TemplateSeriesV1[] = [];
-    for (const entry of entries.filter((item) => item.isDirectory() && !item.name.startsWith("."))) {
-      if (!SAFE_SEGMENT.test(entry.name)) continue;
+    const directories = entries.filter((item) => item.isDirectory() && !item.name.startsWith("."));
+    const safeNames = directories.filter((entry) => isSafeSegment(entry.name)).map((entry) => entry.name);
+    assertNoPortableCaseCollision(safeNames, "template series directories");
+    for (const entry of directories) {
+      if (!isSafeSegment(entry.name)) continue;
       const series = await this.getSeries(entry.name);
       if (series && (options.includeArchived || series.status !== "archived")) result.push(series);
     }
@@ -1946,7 +1971,7 @@ export class VersionedTemplateLibrary {
     const releases: TemplateReleaseV1[] = [];
     for (const entry of entries.filter((item) => item.isFile() && item.name.endsWith(".json"))) {
       const releaseId = entry.name.slice(0, -5);
-      if (!SAFE_SEGMENT.test(releaseId)) throw new Error(`unsafe release filename: ${entry.name}`);
+      if (!isSafeSegment(releaseId)) throw new Error(`unsafe release filename: ${entry.name}`);
       releases.push(await this.requireRelease(templateId, releaseId));
     }
     return releases.sort(
@@ -2007,7 +2032,7 @@ export class VersionedTemplateLibrary {
     }
     const revisions: TemplateHistory["revisions"] = [];
     for (const entry of entries.filter((item) => item.isDirectory() && !item.name.startsWith("."))) {
-      if (!SAFE_SEGMENT.test(entry.name)) throw new Error(`unsafe revision directory: ${entry.name}`);
+      if (!isSafeSegment(entry.name)) throw new Error(`unsafe revision directory: ${entry.name}`);
       const content = await this.requireContent(templateId, entry.name);
       revisions.push({
         revisionId: content.revisionId,
@@ -2221,6 +2246,7 @@ export class VersionedTemplateLibrary {
     assessment?: ReviewAssessmentInput;
   }): Promise<WorkingRevisionPlan> {
     const templateId = assertSafeSegment(options.templateId ?? generatedId("template"), "templateId");
+    await this.assertNoTemplateIdCaseCollision(templateId);
     const series = await this.getSeries(templateId);
     if (series?.status === "archived") throw new Error(`template series is archived: ${templateId}`);
     if (series?.workingHead) throw new Error(`template already has a working head: ${templateId}`);
@@ -2242,6 +2268,7 @@ export class VersionedTemplateLibrary {
       action: "create_working",
       templateId,
       expectedSeriesDigest: series ? templateSeriesDigest(series) : null,
+      ...(this.runtimeContext ? { libraryContext: this.runtimeContext } : {}),
       createdAt,
       content: prepared.content,
       review: prepared.review,
@@ -2274,6 +2301,7 @@ export class VersionedTemplateLibrary {
       action: "update_working",
       templateId: options.templateId,
       expectedSeriesDigest: templateSeriesDigest(series),
+      ...(this.runtimeContext ? { libraryContext: this.runtimeContext } : {}),
       createdAt,
       content: prepared.content,
       review: prepared.review,
@@ -2339,6 +2367,7 @@ export class VersionedTemplateLibrary {
       action: "update_gates",
       templateId: options.templateId,
       expectedSeriesDigest: templateSeriesDigest(series),
+      ...(this.runtimeContext ? { libraryContext: this.runtimeContext } : {}),
       createdAt,
       review,
     });
@@ -2381,6 +2410,7 @@ export class VersionedTemplateLibrary {
       action: "publish",
       templateId: options.templateId,
       expectedSeriesDigest: templateSeriesDigest(series),
+      ...(this.runtimeContext ? { libraryContext: this.runtimeContext } : {}),
       createdAt: publishedAt,
       release: { ...releaseWithoutDigest, releaseDigest: digestRelease(releaseWithoutDigest) },
     });
@@ -2395,6 +2425,7 @@ export class VersionedTemplateLibrary {
       action: "discard_working",
       templateId: options.templateId,
       expectedSeriesDigest: templateSeriesDigest(series),
+      ...(this.runtimeContext ? { libraryContext: this.runtimeContext } : {}),
       createdAt,
       discardedRevisionId: series.workingHead.revisionId,
     });
@@ -2448,6 +2479,7 @@ export class VersionedTemplateLibrary {
       action: "restore_release",
       templateId: options.templateId,
       expectedSeriesDigest: templateSeriesDigest(series),
+      ...(this.runtimeContext ? { libraryContext: this.runtimeContext } : {}),
       createdAt,
       content,
       review: { ...reviewWithoutDigest, reviewDigest: digestReview(reviewWithoutDigest) },
@@ -2467,6 +2499,7 @@ export class VersionedTemplateLibrary {
 
   async planAdoptLegacy(options: LegacyAdoptionOptions): Promise<LegacyAdoptionPlan> {
     const templateId = assertSafeSegment(options.templateId, "templateId");
+    await this.assertNoTemplateIdCaseCollision(templateId);
     if (await this.getSeries(templateId)) throw new Error(`template already has a versioned series: ${templateId}`);
     const directory = this.legacyTemplateDirectory(templateId);
     const manifestFile = path.join(directory, "template.json");
@@ -2589,6 +2622,7 @@ export class VersionedTemplateLibrary {
       action: "adopt_legacy",
       templateId,
       expectedSeriesDigest: null,
+      ...(this.runtimeContext ? { libraryContext: this.runtimeContext } : {}),
       createdAt,
       migrationId: generatedId("migration"),
       legacy: {
@@ -2619,6 +2653,10 @@ export class VersionedTemplateLibrary {
     assertSafeSegment(plan.templateId, "templateId");
     assertString(plan.createdAt, "plan createdAt");
     if (plan.expectedSeriesDigest !== null) assertHash(plan.expectedSeriesDigest, "expected series digest");
+    if (plan.libraryContext !== undefined) {
+      const context = validateLibraryOperationContextValue(plan.libraryContext);
+      assertLibraryOperationContext(this.runtimeContext, context);
+    }
     assertHash(plan.planDigest, "plan digest");
     if (planDigest(plan) !== plan.planDigest) throw new Error("lifecycle plan digest mismatch");
     if (plan.action === "create_working" || plan.action === "update_working" || plan.action === "restore_release") {
@@ -2757,7 +2795,7 @@ export class VersionedTemplateLibrary {
       }
       roots.push(
         ...entries
-          .filter((entry) => entry.isDirectory() && SAFE_SEGMENT.test(entry.name))
+          .filter((entry) => entry.isDirectory() && isSafeSegment(entry.name))
           .map((entry) => path.join(this.captureReceiptsDirectory, entry.name)),
       );
     }
@@ -2951,6 +2989,11 @@ export class VersionedTemplateLibrary {
     if (value.expectedSeriesDigest !== null) {
       assertHash(value.expectedSeriesDigest, "lifecycle intent expected series digest");
     }
+    let libraryContext: LibraryOperationContext | undefined;
+    if (value.libraryContext !== undefined) {
+      libraryContext = validateLibraryOperationContextValue(value.libraryContext);
+      assertLibraryOperationContext(this.runtimeContext, libraryContext);
+    }
     const expectedSeries = value.expectedSeries === null
       ? null
       : validateSeriesValue(value.expectedSeries, value.templateId);
@@ -3055,6 +3098,7 @@ export class VersionedTemplateLibrary {
       nextSeries,
       objects: value.objects as LifecycleOperationIntentV1["objects"],
       result,
+      ...(libraryContext ? { libraryContext } : {}),
       ...(publicPlan ? { publicPlan } : {}),
       ...(captureReceipt ? { captureReceipt } : {}),
       ...(adoptionReceipt ? { adoptionReceipt } : {}),
@@ -3085,6 +3129,7 @@ export class VersionedTemplateLibrary {
       action: intent.action,
       templateId: intent.templateId,
       appliedAt: intent.result.appliedAt,
+      ...(intent.libraryContext ? { libraryContext: intent.libraryContext } : {}),
       ...(intent.publicPlan ? { publicPlan: intent.publicPlan } : {}),
       result: intent.result,
     };
@@ -3362,6 +3407,10 @@ export class VersionedTemplateLibrary {
       if (receipt.appliedAt !== result.appliedAt) {
         throw new Error(`lifecycle operation receipt timestamp mismatch: ${operationId}`);
       }
+      if (receipt.libraryContext !== undefined) {
+        const context = validateLibraryOperationContextValue(receipt.libraryContext);
+        assertLibraryOperationContext(this.runtimeContext, context);
+      }
       if (receipt.publicPlan) {
         validatePublicPlanBinding(
           receipt.publicPlan,
@@ -3537,6 +3586,7 @@ export class VersionedTemplateLibrary {
           action: plan.action,
           templateId: plan.templateId,
           expectedSeriesDigest: plan.expectedSeriesDigest,
+          ...(plan.libraryContext ? { libraryContext: plan.libraryContext } : {}),
           expectedSeries: current ?? null,
           preparedAt: appliedAt,
           ...(publicBinding ? { publicPlan: publicBinding } : {}),

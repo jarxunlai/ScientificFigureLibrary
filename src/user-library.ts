@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { buildSearchIntent, scoreSearchableTemplate } from "./catalog.ts";
+import { withCrossRuntimeWriteLock } from "./cross-runtime-lock.ts";
 import {
   assetFingerprints,
   discoverGalleryEntries,
@@ -16,6 +16,16 @@ import {
   prepareTransferPackage,
   type PreparedTemplate,
 } from "./importers.ts";
+import {
+  assertPortableSegment,
+  ensureLibraryRootMarker,
+  operationContextForSnapshot,
+  portableCaseFold,
+  resolveLibraryRuntimeSnapshotSync,
+  type LibraryDirectorySource,
+  type LibraryOperationContext,
+  type LibraryRuntimeSnapshot,
+} from "./library-runtime.ts";
 import type {
   AssetFingerprintsV1,
   AssetKind,
@@ -338,6 +348,7 @@ export interface DirectImportPlan {
   contentHash: string;
   changes: ImportChange[];
   matches: DirectImportMatch[];
+  libraryContext?: LibraryOperationContext;
   planDigest: string;
   written: false;
 }
@@ -558,18 +569,26 @@ function hasStrongAssetContinuity(kinds: string[]) {
 export class UserTemplateLibrary {
   readonly root: string;
   readonly templatesDirectory: string;
-  readonly directorySource: "argument" | "FIGURE_LIBRARY_DIR" | "default";
+  readonly directorySource: LibraryDirectorySource;
   readonly writeLockDirectory: string;
   readonly transactionsDirectory: string;
+  readonly writesEnabled: boolean;
+  readonly runtimeContext?: LibraryOperationContext;
+  private libraryId?: string;
 
-  constructor(root?: string) {
-    const environmentRoot = process.env.FIGURE_LIBRARY_DIR?.trim() || undefined;
-    const selected = root ?? environmentRoot ?? path.join(os.homedir(), ".figure-library");
-    this.directorySource = root ? "argument" : environmentRoot ? "FIGURE_LIBRARY_DIR" : "default";
-    this.root = path.resolve(selected);
+  constructor(root?: string | LibraryRuntimeSnapshot) {
+    const selected =
+      typeof root === "string"
+        ? resolveLibraryRuntimeSnapshotSync({ root })
+        : root ?? resolveLibraryRuntimeSnapshotSync();
+    this.directorySource = selected.directorySource;
+    this.root = path.resolve(selected.root);
     this.templatesDirectory = path.join(this.root, "templates");
     this.writeLockDirectory = path.join(this.root, ".write-lock");
     this.transactionsDirectory = path.join(this.root, "transactions");
+    this.writesEnabled = selected.writesEnabled;
+    this.libraryId = selected.libraryId;
+    this.runtimeContext = operationContextForSnapshot(selected);
   }
 
   private async incompleteTransactions() {
@@ -601,39 +620,32 @@ export class UserTemplateLibrary {
     callback: () => Promise<T>,
     options: { allowIncompleteTransaction?: string } = {},
   ) {
-    await fs.mkdir(this.root, { recursive: true });
-    try {
-      await fs.mkdir(this.writeLockDirectory);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        let owner = "unknown writer";
-        try {
-          owner = await fs.readFile(path.join(this.writeLockDirectory, "owner.json"), "utf8");
-        } catch {
-          // Preserve a missing/corrupt lock for manual recovery.
-        }
-        throw new Error(`user library is write-locked; manual recovery required: ${owner}`);
-      }
-      throw error;
+    if (!this.writesEnabled) {
+      throw new Error(
+        "library_not_bound: the legacy ~/.figure-library default is read-only until the global library is explicitly bound",
+      );
     }
-    try {
-      await fs.writeFile(
-        path.join(this.writeLockDirectory, "owner.json"),
-        `${JSON.stringify({ operation, pid: process.pid, createdAt: new Date().toISOString() }, null, 2)}\n`,
-        { flag: "wx" },
-      );
-      const incomplete = (await this.incompleteTransactions()).filter(
-        (transactionId) => transactionId !== options.allowIncompleteTransaction,
-      );
-      if (incomplete.length) {
-        throw new Error(
-          `incomplete user-library transaction requires recovery: ${incomplete.join(", ")}`,
+    const marker = await ensureLibraryRootMarker(this.root, this.libraryId);
+    this.libraryId = marker.value.libraryId;
+    return withCrossRuntimeWriteLock(
+      {
+        root: this.root,
+        lockDirectory: this.writeLockDirectory,
+        libraryId: marker.value.libraryId,
+        operation: `flat-library:${operation}`,
+      },
+      async () => {
+        const incomplete = (await this.incompleteTransactions()).filter(
+          (transactionId) => transactionId !== options.allowIncompleteTransaction,
         );
-      }
-      return await callback();
-    } finally {
-      await fs.rm(this.writeLockDirectory, { recursive: true, force: true });
-    }
+        if (incomplete.length) {
+          throw new Error(
+            `incomplete user-library transaction requires recovery: ${incomplete.join(", ")}`,
+          );
+        }
+        return await callback();
+      },
+    );
   }
 
   async scanTemplates(options: { verifyFiles?: boolean } = {}): Promise<TemplateScan> {
@@ -646,10 +658,36 @@ export class UserTemplateLibrary {
     }
     const valid: ScannedTemplate[] = [];
     const invalid: TemplateDiagnostic[] = [];
+    const directoryNames = entries
+      .filter((item) => item.isDirectory() && !item.name.startsWith("."))
+      .map((item) => item.name);
+    const foldedCounts = new Map<string, number>();
+    for (const name of directoryNames) {
+      const folded = portableCaseFold(name);
+      foldedCounts.set(folded, (foldedCounts.get(folded) ?? 0) + 1);
+    }
     for (const entry of entries.filter((item) => !item.name.startsWith("."))) {
       const directory = path.join(this.templatesDirectory, entry.name);
       if (!entry.isDirectory()) {
         invalid.push({ directoryName: entry.name, directory, error: "template entry is not a directory" });
+        continue;
+      }
+      try {
+        assertPortableSegment(entry.name, "template directory name");
+      } catch (error) {
+        invalid.push({
+          directoryName: entry.name,
+          directory,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+      if ((foldedCounts.get(portableCaseFold(entry.name)) ?? 0) > 1) {
+        invalid.push({
+          directoryName: entry.name,
+          directory,
+          error: "portable case-fold collision between template directories",
+        });
         continue;
       }
       let value: unknown;
@@ -904,6 +942,7 @@ export class UserTemplateLibrary {
       contentHash: prepared.contentHash,
       changes,
       matches: publicMatches,
+      ...(this.runtimeContext ? { libraryContext: this.runtimeContext } : {}),
     };
     const plan: DirectImportPlan = {
       ...planPayload,
@@ -978,6 +1017,30 @@ export class UserTemplateLibrary {
         plan.action === "unchanged" &&
         plan.proposedTemplateId === expectedTemplateId
       ) {
+        // A successful create necessarily changes a freshly recomputed plan to
+        // `unchanged`. Reconstruct the exact pre-create payload before treating
+        // that state as an idempotent replay. In particular, keep the current
+        // libraryContext in the reconstructed digest: an old create plan from a
+        // different libraryId or locator revision must never be accepted merely
+        // because that other library happens to contain identical bytes under
+        // the same content-addressed templateId.
+        const {
+          planDigest: _currentPlanDigest,
+          written: _currentWritten,
+          ...currentPayload
+        } = plan;
+        const replayPayload = {
+          ...currentPayload,
+          action: "create" as const,
+          changes: [],
+          matches: [],
+        };
+        const replayDigest = sha256(JSON.stringify(comparable(replayPayload)));
+        if (replayDigest !== planDigest) {
+          throw new Error(
+            "stale import plan: create replay does not match the current library context",
+          );
+        }
         const existing = await this.get(expectedTemplateId);
         if (!existing) throw new Error("safe replay target disappeared");
         return { ...existing, action: "unchanged" as const, replayed: true, plan };
@@ -1147,6 +1210,7 @@ export class UserTemplateLibrary {
   }
 
   private async writePrepared(prepared: PreparedTemplate, existing?: LoadedTemplate) {
+    assertPortableSegment(prepared.templateId, "templateId");
     const target = existing?.directory ?? path.join(this.templatesDirectory, prepared.templateId);
     if (!existing) {
       try {

@@ -7,6 +7,7 @@ import https from "node:https";
 import { isIP, type LookupFunction } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { Readable } from "node:stream";
 
 export const CAPTURE_MANIFEST_SCHEMA = "figure-library.capture-record.v1" as const;
@@ -32,6 +33,7 @@ export const CAPTURE_TOTAL_TIMEOUT_MS = 90_000;
 const MAX_REDIRECTS = 6;
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+export type CaptureLibraryRootProvider = () => string | Promise<string>;
 export interface CaptureResolvedAddress {
   address: string;
   family: 4 | 6;
@@ -87,7 +89,7 @@ class CaptureDeadline {
 
   constructor(timeoutMs: number, externalSignal?: AbortSignal) {
     this.signal = this.controller.signal;
-    this.deadlineAt = Date.now() + timeoutMs;
+    this.deadlineAt = performance.now() + timeoutMs;
     this.externalSignal = externalSignal;
     this.externalAbort = externalSignal
       ? () =>
@@ -129,7 +131,7 @@ class CaptureDeadline {
   }
 
   throwIfAborted() {
-    if (!this.signal.aborted && Date.now() >= this.deadlineAt) {
+    if (!this.signal.aborted && performance.now() >= this.deadlineAt) {
       this.abort(
         "capture_deadline_exceeded",
         "article capture exceeded its total deadline; no capture was stored",
@@ -176,8 +178,9 @@ class CaptureDeadline {
 export interface CaptureDirectoryStatus {
   configured: boolean;
   enabled: boolean;
-  source: "constructor" | "environment" | "unconfigured";
+  source: "constructor" | "environment" | "project" | "unconfigured";
   root?: string;
+  projectDirectory?: string;
   libraryRoot?: string;
   isolated: boolean;
   exists: boolean;
@@ -410,12 +413,13 @@ function assertSafeSegment(value: string, label: string) {
   return value;
 }
 
+function pathContains(parent: string, child: string) {
+  const relative = path.relative(parent, child);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 function rootsOverlap(left: string, right: string) {
-  const contains = (parent: string, child: string) => {
-    const relative = path.relative(parent, child);
-    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-  };
-  return contains(left, right) || contains(right, left);
+  return pathContains(left, right) || pathContains(right, left);
 }
 
 async function canonicalFuturePath(candidate: string) {
@@ -1193,9 +1197,12 @@ function receiptMatch(value: unknown, captureId: string, captureHashes: Set<stri
 }
 
 export class CaptureStore {
-  readonly root?: string;
-  readonly source: CaptureDirectoryStatus["source"];
+  root?: string;
+  source: CaptureDirectoryStatus["source"];
   readonly libraryRoot?: string;
+  private projectDirectory?: string;
+  private projectIdentity?: string;
+  private libraryRootProvider?: CaptureLibraryRootProvider;
   private readonly resolver: CaptureResolver;
   private readonly requestTransport: CaptureRequestTransport;
   private readonly requestTimeoutMs: number;
@@ -1208,6 +1215,7 @@ export class CaptureStore {
     requestTransport?: CaptureRequestTransport,
     requestTimeoutMs = FETCH_TIMEOUT_MS,
     captureTimeoutMs = CAPTURE_TOTAL_TIMEOUT_MS,
+    libraryRootProvider?: CaptureLibraryRootProvider,
   ) {
     const explicit = root?.trim();
     const environment = process.env.FIGURE_CAPTURE_DIR?.trim();
@@ -1218,6 +1226,7 @@ export class CaptureStore {
     this.libraryRoot = path.resolve(
       environmentLibraryRoot ?? path.join(os.homedir(), ".figure-library"),
     );
+    this.libraryRootProvider = libraryRootProvider;
     this.resolver =
       resolver ??
       (async (hostname) => {
@@ -1244,6 +1253,167 @@ export class CaptureStore {
     this.captureTimeoutMs = captureTimeoutMs;
   }
 
+  setLibraryRootProvider(provider?: CaptureLibraryRootProvider) {
+    this.libraryRootProvider = provider;
+    return this;
+  }
+
+  private async effectiveLibraryRoot() {
+    if (this.libraryRootProvider) {
+      const selected = (await this.libraryRootProvider()).trim();
+      if (!selected || !path.isAbsolute(selected)) {
+        throw new CaptureError(
+          "capture_library_root_invalid",
+          "the canonical Library root provider must return an absolute directory path",
+        );
+      }
+      return path.resolve(selected);
+    }
+    return path.resolve(this.libraryRoot || path.join(os.homedir(), ".figure-library"));
+  }
+
+  private async assertManagedStoreBoundary() {
+    if (!this.root) {
+      throw new CaptureError("capture_not_configured", "Capture is not configured");
+    }
+    let rootStat;
+    try {
+      rootStat = await fs.lstat(this.root);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      throw new CaptureError(
+        "capture_path_unsafe",
+        "Capture root must be a real non-symlink directory",
+      );
+    }
+    const canonicalRoot = path.resolve(await fs.realpath(this.root));
+    for (const directory of [
+      path.join(this.root, "captures"),
+      path.join(this.root, "operations"),
+    ]) {
+      try {
+        const stat = await fs.lstat(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) {
+          throw new CaptureError(
+            "capture_path_unsafe",
+            `Capture managed directory must be real, not a symlink: ${directory}`,
+          );
+        }
+        const canonical = path.resolve(await fs.realpath(directory));
+        if (!pathContains(canonicalRoot, canonical)) {
+          throw new CaptureError(
+            "capture_path_unsafe",
+            `Capture managed directory escapes the Capture root: ${directory}`,
+          );
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+  }
+
+  private async assertCaptureDirectoryBoundary(captureId: string) {
+    await this.assertManagedStoreBoundary();
+    if (!this.root) throw new CaptureError("capture_not_configured", "Capture is not configured");
+    const directory = this.captureDirectory(captureId);
+    try {
+      const stat = await fs.lstat(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new CaptureError(
+          "capture_path_unsafe",
+          `Capture record directory must be real, not a symlink: ${captureId}`,
+        );
+      }
+      const canonicalRoot = path.resolve(await fs.realpath(this.root));
+      const canonical = path.resolve(await fs.realpath(directory));
+      if (!pathContains(canonicalRoot, canonical)) {
+        throw new CaptureError(
+          "capture_path_unsafe",
+          `Capture record directory escapes the Capture root: ${captureId}`,
+        );
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
+  private async assertRegularManagedFileIfExists(file: string, label: string) {
+    try {
+      const stat = await fs.lstat(file);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new CaptureError(
+          "capture_path_unsafe",
+          `${label} must be a regular non-symlink file`,
+        );
+      }
+      if (!this.root) throw new CaptureError("capture_not_configured", "Capture is not configured");
+      const canonicalRoot = path.resolve(await fs.realpath(this.root));
+      const canonical = path.resolve(await fs.realpath(file));
+      if (!pathContains(canonicalRoot, canonical)) {
+        throw new CaptureError("capture_path_unsafe", `${label} escapes the Capture root`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
+  /**
+   * Bind an otherwise-unconfigured process to the trusted host project. Explicit constructor
+   * and FIGURE_CAPTURE_DIR roots always win. A project binding is intentionally process-local:
+   * the same project is idempotent, while a second project is rejected rather than mixing raw
+   * Capture payloads between Wisp projects.
+   */
+  async bindProjectDirectory(projectDirectory?: string) {
+    const supplied = projectDirectory?.trim();
+    if (!supplied || this.source === "constructor" || this.source === "environment") return;
+    if (!path.isAbsolute(supplied)) {
+      throw new CaptureError(
+        "capture_project_invalid",
+        "trusted projectDirectory must be an absolute host-local directory",
+      );
+    }
+
+    const requested = path.resolve(supplied);
+    let canonical: string;
+    try {
+      canonical = path.resolve(await fs.realpath(requested));
+      const stat = await fs.stat(canonical);
+      if (!stat.isDirectory()) {
+        throw new CaptureError(
+          "capture_project_invalid",
+          "trusted projectDirectory is not a directory",
+        );
+      }
+    } catch (error) {
+      if (error instanceof CaptureError) throw error;
+      throw new CaptureError(
+        "capture_project_invalid",
+        `cannot resolve trusted projectDirectory: ${(error as Error).message}`,
+        { cause: error },
+      );
+    }
+
+    const identity = process.platform === "win32" ? canonical.toLocaleLowerCase() : canonical;
+    // Re-check after the awaits above so two concurrent first calls cannot bind different roots.
+    if (this.projectIdentity) {
+      if (this.projectIdentity !== identity) {
+        throw new CaptureError(
+          "capture_project_mismatch",
+          `this plugin process is already bound to ${this.projectDirectory}; refusing a different projectDirectory`,
+        );
+      }
+      return;
+    }
+
+    this.projectIdentity = identity;
+    this.projectDirectory = canonical;
+    this.root = path.join(canonical, ".wisp", "figure-captures");
+    this.source = "project";
+  }
+
   async status(): Promise<CaptureDirectoryStatus> {
     if (!this.root) {
       return {
@@ -1256,19 +1426,58 @@ export class CaptureStore {
         writable: false,
         creatable: false,
         available: false,
-        reason: "FIGURE_CAPTURE_DIR is not configured; Capture is disabled without affecting the library",
+        reason:
+          "Capture needs FIGURE_CAPTURE_DIR or a trusted projectDirectory; it is disabled without affecting the library",
+      };
+    }
+    let libraryRoot: string;
+    try {
+      libraryRoot = await this.effectiveLibraryRoot();
+    } catch (error) {
+      return {
+        configured: true,
+        enabled: false,
+        source: this.source,
+        root: this.root,
+        ...(this.projectDirectory ? { projectDirectory: this.projectDirectory } : {}),
+        isolated: false,
+        exists: false,
+        readable: false,
+        writable: false,
+        creatable: false,
+        available: false,
+        reason: `cannot resolve the current canonical Library root: ${(error as Error).message}`,
       };
     }
     const [canonicalCaptureRoot, canonicalLibraryRoot] = await Promise.all([
       canonicalFuturePath(this.root),
-      this.libraryRoot ? canonicalFuturePath(this.libraryRoot) : Promise.resolve(undefined),
+      canonicalFuturePath(libraryRoot),
     ]);
-    const isolated = this.libraryRoot
-      ? !rootsOverlap(
-          canonicalCaptureRoot ?? this.root,
-          canonicalLibraryRoot ?? this.libraryRoot,
-        )
-      : true;
+    if (
+      this.projectDirectory &&
+      !pathContains(this.projectDirectory, canonicalCaptureRoot ?? this.root)
+    ) {
+      return {
+        configured: true,
+        enabled: false,
+        source: this.source,
+        root: this.root,
+        projectDirectory: this.projectDirectory,
+        libraryRoot,
+        isolated: true,
+        exists: false,
+        readable: false,
+        writable: false,
+        creatable: false,
+        available: false,
+        reason:
+          "project-local Capture path escapes projectDirectory through an intermediate symbolic link",
+      };
+    }
+    const isolated = !rootsOverlap(
+      canonicalCaptureRoot ?? this.root,
+      canonicalLibraryRoot ?? libraryRoot,
+    );
     if (!isolated) {
       const exists = await fs.lstat(this.root).then(
         () => true,
@@ -1282,7 +1491,8 @@ export class CaptureStore {
         enabled: false,
         source: this.source,
         root: this.root,
-        libraryRoot: this.libraryRoot,
+        ...(this.projectDirectory ? { projectDirectory: this.projectDirectory } : {}),
+        libraryRoot,
         isolated: false,
         exists,
         readable: false,
@@ -1300,7 +1510,8 @@ export class CaptureStore {
           enabled: false,
           source: this.source,
           root: this.root,
-          ...(this.libraryRoot ? { libraryRoot: this.libraryRoot } : {}),
+          ...(this.projectDirectory ? { projectDirectory: this.projectDirectory } : {}),
+          libraryRoot,
           isolated: true,
           exists: true,
           readable: false,
@@ -1308,6 +1519,25 @@ export class CaptureStore {
           creatable: false,
           available: false,
           reason: "FIGURE_CAPTURE_DIR must be a real directory, not a file or symbolic link",
+        };
+      }
+      try {
+        await this.assertManagedStoreBoundary();
+      } catch (error) {
+        return {
+          configured: true,
+          enabled: false,
+          source: this.source,
+          root: this.root,
+          ...(this.projectDirectory ? { projectDirectory: this.projectDirectory } : {}),
+          libraryRoot,
+          isolated: true,
+          exists: true,
+          readable: false,
+          writable: false,
+          creatable: false,
+          available: false,
+          reason: error instanceof Error ? error.message : String(error),
         };
       }
       const readable = await fs.access(this.root, fsConstants.R_OK).then(
@@ -1323,7 +1553,8 @@ export class CaptureStore {
         enabled: readable && writable,
         source: this.source,
         root: this.root,
-        ...(this.libraryRoot ? { libraryRoot: this.libraryRoot } : {}),
+        ...(this.projectDirectory ? { projectDirectory: this.projectDirectory } : {}),
+        libraryRoot,
         isolated: true,
         exists: true,
         readable,
@@ -1341,7 +1572,8 @@ export class CaptureStore {
           enabled: false,
           source: this.source,
           root: this.root,
-          ...(this.libraryRoot ? { libraryRoot: this.libraryRoot } : {}),
+          ...(this.projectDirectory ? { projectDirectory: this.projectDirectory } : {}),
+          libraryRoot,
           isolated: true,
           exists: false,
           readable: false,
@@ -1364,7 +1596,8 @@ export class CaptureStore {
         enabled: creatable,
         source: this.source,
         root: this.root,
-        ...(this.libraryRoot ? { libraryRoot: this.libraryRoot } : {}),
+        ...(this.projectDirectory ? { projectDirectory: this.projectDirectory } : {}),
+        libraryRoot,
         isolated: true,
         exists: false,
         readable: false,
@@ -1387,9 +1620,58 @@ export class CaptureStore {
     if (!status.available || !this.root) {
       throw new CaptureError("capture_directory_unavailable", status.reason ?? "Capture directory is unavailable");
     }
-    await fs.mkdir(path.join(this.root, "captures"), { recursive: true });
-    await fs.mkdir(path.join(this.root, "operations"), { recursive: true });
+    await fs.mkdir(this.root, { recursive: true });
+    const rootStat = await fs.lstat(this.root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      throw new CaptureError(
+        "capture_directory_unavailable",
+        "Capture root must remain a real directory while it is initialized",
+      );
+    }
+    await this.assertManagedStoreBoundary();
+    await this.ensureLocalGitignore();
+    for (const directory of [
+      path.join(this.root, "captures"),
+      path.join(this.root, "operations"),
+    ]) {
+      try {
+        await fs.mkdir(directory);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      const stat = await fs.lstat(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new CaptureError(
+          "capture_path_unsafe",
+          `Capture managed directory must be real, not a symlink: ${directory}`,
+        );
+      }
+    }
+    await this.assertManagedStoreBoundary();
     return this.root;
+  }
+
+  private async ensureLocalGitignore() {
+    if (!this.root) return;
+    const target = path.join(this.root, ".gitignore");
+    const marker = "# ScientificFigureLibrary project-local Raw Capture";
+    const managedBlock = `${marker}\n*\n!.gitignore\n`;
+    let existing = "";
+    try {
+      const stat = await fs.lstat(target);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new CaptureError(
+          "capture_gitignore_invalid",
+          "Capture-local .gitignore must be a regular file",
+        );
+      }
+      existing = await fs.readFile(target, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (existing.includes(marker)) return;
+    const separator = existing && !existing.endsWith("\n") ? "\n" : "";
+    await fs.appendFile(target, `${separator}${managedBlock}`, { encoding: "utf8" });
   }
 
   private captureDirectory(captureId: string) {
@@ -1569,7 +1851,12 @@ export class CaptureStore {
   }
 
   private async loadManifest(captureId: string) {
+    await this.assertCaptureDirectoryBoundary(captureId);
     const directory = this.captureDirectory(captureId);
+    await this.assertRegularManagedFileIfExists(
+      path.join(directory, "manifest.json"),
+      "Capture manifest",
+    );
     let value: unknown;
     try {
       value = JSON.parse(await fs.readFile(path.join(directory, "manifest.json"), "utf8"));
@@ -1587,7 +1874,9 @@ export class CaptureStore {
   }
 
   private async loadState(captureId: string) {
+    await this.assertCaptureDirectoryBoundary(captureId);
     const directory = this.captureDirectory(captureId);
+    await this.assertRegularManagedFileIfExists(path.join(directory, "state.json"), "Capture state");
     let value: unknown;
     try {
       value = JSON.parse(await fs.readFile(path.join(directory, "state.json"), "utf8"));
@@ -1601,8 +1890,10 @@ export class CaptureStore {
   }
 
   private async writeState(captureId: string, state: CaptureStateV1) {
+    await this.assertCaptureDirectoryBoundary(captureId);
     const directory = this.captureDirectory(captureId);
     const target = path.join(directory, "state.json");
+    await this.assertRegularManagedFileIfExists(target, "Capture state");
     const transactionId = randomUUID();
     const temporary = path.join(directory, `.state-${transactionId}.json`);
     const backup = path.join(directory, `.state-${transactionId}.backup.json`);
@@ -1623,6 +1914,11 @@ export class CaptureStore {
   }
 
   private async readOperation(operationId: string) {
+    await this.assertManagedStoreBoundary();
+    await this.assertRegularManagedFileIfExists(
+      this.operationFile(operationId),
+      "Capture operation receipt",
+    );
     let value: unknown;
     try {
       value = JSON.parse(await fs.readFile(this.operationFile(operationId), "utf8"));
@@ -1648,7 +1944,9 @@ export class CaptureStore {
   }
 
   private async writeOperation(receipt: OperationReceiptV1, deadline: CaptureDeadline) {
+    await this.assertManagedStoreBoundary();
     const file = this.operationFile(receipt.operationId);
+    await this.assertRegularManagedFileIfExists(file, "Capture operation receipt");
     let handle: fs.FileHandle | undefined;
     let created = false;
     try {
@@ -2150,6 +2448,15 @@ export class CaptureStore {
   private async checkedAsset(captureId: string, assetId: string) {
     assertSafeSegment(assetId, "assetId");
     const safeCaptureId = assertSafeSegment(captureId, "captureId");
+    const recordDirectory = this.captureDirectory(safeCaptureId);
+    const recordStat = await fs.lstat(recordDirectory);
+    if (!recordStat.isDirectory() || recordStat.isSymbolicLink()) {
+      throw new CaptureError(
+        "capture_record_invalid",
+        `capture record is not a real directory: ${captureId}`,
+      );
+    }
+    const canonicalRecordDirectory = await fs.realpath(recordDirectory);
     const manifest = await this.loadManifest(safeCaptureId);
     if (!manifest) throw new CaptureError("capture_not_found", `unknown capture: ${captureId}`);
     const assets: Array<{
@@ -2165,7 +2472,43 @@ export class CaptureStore {
     if (!selected) {
       throw new CaptureError("capture_asset_not_found", `unknown capture asset: ${assetId}`);
     }
-    const sourcePath = resolveStoredFile(this.captureDirectory(safeCaptureId), selected.file);
+    const sourcePath = resolveStoredFile(recordDirectory, selected.file);
+    let canonicalSourcePath: string;
+    try {
+      canonicalSourcePath = await fs.realpath(sourcePath);
+    } catch (error) {
+      throw new CaptureError(
+        "capture_asset_invalid",
+        `cannot resolve capture asset: ${assetId}`,
+        { cause: error },
+      );
+    }
+    if (
+      canonicalSourcePath === canonicalRecordDirectory ||
+      !pathContains(canonicalRecordDirectory, canonicalSourcePath)
+    ) {
+      throw new CaptureError(
+        "capture_asset_path_escape",
+        `capture asset resolves outside its capture record: ${assetId}`,
+      );
+    }
+
+    // The stored manifest permits only nested portable paths. Reject a symlink in any parent
+    // component even when it currently points back inside the record: immutable Capture assets
+    // must not depend on a mutable directory indirection.
+    const normalizedFile = validateRelativeFile(selected.file);
+    let parent = recordDirectory;
+    for (const segment of normalizedFile.split("/").slice(0, -1)) {
+      parent = path.join(parent, segment);
+      const parentStat = await fs.lstat(parent);
+      if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+        throw new CaptureError(
+          "capture_asset_parent_invalid",
+          `capture asset parent is not a real directory: ${assetId}`,
+        );
+      }
+    }
+
     const stat = await fs.lstat(sourcePath);
     if (!stat.isFile() || stat.isSymbolicLink()) {
       throw new CaptureError("capture_asset_invalid", `capture asset is not a regular file: ${assetId}`);
@@ -2173,7 +2516,51 @@ export class CaptureStore {
     if (stat.size !== selected.bytes) {
       throw new CaptureError("capture_asset_size_mismatch", `capture asset size mismatch: ${assetId}`);
     }
-    const bytes = new Uint8Array(await fs.readFile(sourcePath));
+    const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+    let handle;
+    try {
+      handle = await fs.open(sourcePath, fsConstants.O_RDONLY | noFollow);
+    } catch (error) {
+      throw new CaptureError(
+        "capture_asset_invalid",
+        `cannot securely open capture asset: ${assetId}`,
+        { cause: error },
+      );
+    }
+    let bytes: Uint8Array;
+    try {
+      const openedStat = await handle.stat();
+      if (
+        !openedStat.isFile() ||
+        openedStat.dev !== stat.dev ||
+        openedStat.ino !== stat.ino
+      ) {
+        throw new CaptureError(
+          "capture_asset_changed",
+          `capture asset changed while it was being opened: ${assetId}`,
+        );
+      }
+      const [recordAfterOpen, sourceAfterOpen] = await Promise.all([
+        fs.realpath(recordDirectory),
+        fs.realpath(sourcePath),
+      ]);
+      if (
+        recordAfterOpen !== canonicalRecordDirectory ||
+        sourceAfterOpen !== canonicalSourcePath ||
+        !pathContains(recordAfterOpen, sourceAfterOpen)
+      ) {
+        throw new CaptureError(
+          "capture_asset_changed",
+          `capture asset path changed while it was being opened: ${assetId}`,
+        );
+      }
+      bytes = new Uint8Array(await handle.readFile());
+    } finally {
+      await handle.close();
+    }
+    if (bytes.byteLength !== selected.bytes) {
+      throw new CaptureError("capture_asset_size_mismatch", `capture asset size mismatch: ${assetId}`);
+    }
     if (sha256(bytes) !== selected.sha256) {
       throw new CaptureError("capture_asset_checksum_mismatch", `capture asset checksum mismatch: ${assetId}`);
     }

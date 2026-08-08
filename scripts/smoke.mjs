@@ -15,9 +15,10 @@ const serverEntry =
   process.env.FIGURE_LIBRARY_SMOKE_SERVER ?? path.join(root, "dist", "index.js");
 const smokeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "figure-library-smoke-"));
 const libraryDirectory = path.join(smokeRoot, "library");
-const captureDirectory = path.join(smokeRoot, "capture");
+const projectDirectory = path.join(smokeRoot, "plot-project");
+const captureDirectory = path.join(projectDirectory, ".wisp", "figure-captures");
 const sourceDirectory = path.join(smokeRoot, "source");
-await fs.mkdir(sourceDirectory);
+await Promise.all([fs.mkdir(sourceDirectory), fs.mkdir(projectDirectory)]);
 const codePath = path.join(sourceDirectory, "smoke-plot.R");
 await fs.writeFile(codePath, "# unique-smoke-ridge-reference\n");
 const plannedCodePath = path.join(sourceDirectory, "planned-smoke-plot.R");
@@ -173,10 +174,10 @@ const childEnvironment = Object.fromEntries(
   Object.entries(process.env).filter((entry) => typeof entry[1] === "string"),
 );
 childEnvironment.FIGURE_LIBRARY_DIR = libraryDirectory;
-childEnvironment.FIGURE_CAPTURE_DIR = captureDirectory;
+delete childEnvironment.FIGURE_CAPTURE_DIR;
 childEnvironment.FIGURE_CAPTURE_SMOKE_ORIGIN = fixtureOrigin;
 
-const client = new Client({ name: "scientific-figure-library-smoke", version: "0.4.1" });
+const client = new Client({ name: "scientific-figure-library-smoke", version: "0.4.2" });
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: ["--import", captureTransportShimPath, serverEntry],
@@ -267,6 +268,7 @@ const captureTools = [
   "figure_capture_article",
   "figure_capture_list",
   "figure_capture_get",
+  "figure_capture_annotation_open",
   "figure_capture_asset",
   "figure_capture_archive",
   "figure_capture_restore",
@@ -292,11 +294,21 @@ const versionedTools = [
   "figure_library_diff_revisions",
 ];
 
+const projectTools = [
+  "figure_library_plan_bind_global",
+  "figure_library_apply_bind_global",
+  "figure_library_plan_recover_write_lock",
+  "figure_library_apply_recover_write_lock",
+  "figure_library_project_status",
+  "figure_library_plan_project_use",
+  "figure_library_apply_project_use",
+];
+
 try {
   await client.connect(transport);
   const tools = await client.listTools();
   const names = tools.tools.map((tool) => tool.name);
-  for (const required of [...legacyTools, ...captureTools, ...versionedTools]) {
+  for (const required of [...legacyTools, ...captureTools, ...versionedTools, ...projectTools]) {
     if (!names.includes(required)) throw new Error(`missing tool ${required}`);
   }
   const appCallableTools = [
@@ -306,6 +318,7 @@ try {
     "figure_capture_article",
     "figure_capture_list",
     "figure_capture_get",
+    "figure_capture_annotation_open",
     "figure_capture_asset",
     "figure_capture_plan_cleanup",
     "figure_library_review_open",
@@ -322,8 +335,33 @@ try {
     }
   }
 
+  const initialSourceStatus = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_source_status",
+      arguments: { projectDirectory },
+    }),
+    "project-bound source status smoke call",
+  );
+  const initialCaptureStatus = initialSourceStatus.structuredContent?.captureStatus;
+  if (
+    initialSourceStatus.structuredContent?.serverVersion !== "0.4.2" ||
+    initialCaptureStatus?.source !== "project" ||
+    initialCaptureStatus?.projectDirectory !== projectDirectory ||
+    initialCaptureStatus?.root !== captureDirectory ||
+    initialCaptureStatus?.available !== true
+  ) {
+    throw new Error(
+      `source status did not bind project-local Capture: ${JSON.stringify(
+        initialSourceStatus.structuredContent,
+      )}`,
+    );
+  }
+
   const captureOpened = assertSuccessful(
-    await client.callTool({ name: "figure_capture_open", arguments: {} }),
+    await client.callTool({
+      name: "figure_capture_open",
+      arguments: { projectDirectory },
+    }),
     "capture open smoke call",
   );
   const openedCaptureStatus = captureStatus(captureOpened);
@@ -345,6 +383,7 @@ try {
     await client.callTool({
       name: "figure_capture_article",
       arguments: {
+        projectDirectory,
         url: "https://mp.weixin.qq.com/s/smoke",
         operationId: "smoke-capture-article",
       },
@@ -375,6 +414,7 @@ try {
     await client.callTool({
       name: "figure_capture_article",
       arguments: {
+        projectDirectory,
         url: "https://mp.weixin.qq.com/s/smoke",
         operationId: "smoke-capture-article",
       },
@@ -388,7 +428,7 @@ try {
   const captureListed = assertSuccessful(
     await client.callTool({
       name: "figure_capture_list",
-      arguments: { includeArchived: false },
+      arguments: { projectDirectory, includeArchived: false },
     }),
     "capture list smoke call",
   );
@@ -405,7 +445,7 @@ try {
   const captureGot = assertSuccessful(
     await client.callTool({
       name: "figure_capture_get",
-      arguments: { captureId },
+      arguments: { projectDirectory, captureId },
     }),
     "capture get smoke call",
   );
@@ -422,7 +462,7 @@ try {
   const captureAsset = assertSuccessful(
     await client.callTool({
       name: "figure_capture_asset",
-      arguments: { captureId, assetId: primaryVisualId },
+      arguments: { projectDirectory, captureId, assetId: primaryVisualId },
     }),
     "capture asset smoke call",
   );
@@ -430,10 +470,82 @@ try {
     throw new Error("capture asset fallback tool did not return standard MCP image content");
   }
 
+  const annotationDraft = {
+    schema: "figure-library.annotation-draft.v1",
+    title: "Smoke annotation draft",
+    assetKind: "plot_template",
+    visualAssetIds: [primaryVisualId],
+    primaryVisualAssetId: primaryVisualId,
+    codeBlockIds: [primaryCodeId],
+    contextBlockIds: [primaryContextId],
+    canonicalCodeBlockId: primaryCodeId,
+    figureCodeLinks: [
+      {
+        visualAssetId: primaryVisualId,
+        codeBlockIds: [primaryCodeId],
+        evidence: "The offline fixture keeps the code adjacent to this figure.",
+      },
+    ],
+  };
+  const annotationPage1 = assertSuccessful(
+    await client.callTool({
+      name: "figure_capture_annotation_open",
+      arguments: {
+        projectDirectory,
+        captureId,
+        page: 1,
+        pageSize: 1,
+        annotationDraft,
+      },
+    }),
+    "annotation standard-image fallback page 1",
+  );
+  if (
+    annotationPage1.structuredContent?.draftPersisted !== false ||
+    annotationPage1.structuredContent?.imagePage?.pageCount !== 2 ||
+    annotationPage1.structuredContent?.imagePage?.nextPage !== 2 ||
+    !annotationPage1.content?.some((item) => item.type === "image") ||
+    annotationPage1.structuredContent?.annotationDraft?.primaryVisualAssetId !== primaryVisualId
+  ) {
+    throw new Error("annotation_open did not return its bounded image page and draft echo");
+  }
+  const annotationPage2 = assertSuccessful(
+    await client.callTool({
+      name: "figure_capture_annotation_open",
+      arguments: {
+        projectDirectory,
+        captureId,
+        page: 2,
+        pageSize: 1,
+        annotationDraft: annotationPage1.structuredContent.annotationDraft,
+      },
+    }),
+    "annotation standard-image fallback page 2",
+  );
+  if (
+    annotationPage2.structuredContent?.imagePage?.page !== 2 ||
+    annotationPage2.structuredContent?.imagePage?.hasNextPage !== false ||
+    !annotationPage2.content?.some((item) => item.type === "image") ||
+    annotationPage2.structuredContent?.annotationDraft?.canonicalCodeBlockId !== primaryCodeId
+  ) {
+    throw new Error("annotation_open did not carry the validated non-persisted draft across pages");
+  }
+
+  const captureIgnore = await fs.readFile(path.join(captureDirectory, ".gitignore"), "utf8");
+  if (!captureIgnore.includes("ScientificFigureLibrary project-local Raw Capture")) {
+    throw new Error("project-local Capture did not create its protective local .gitignore");
+  }
+  try {
+    await fs.access(path.join(projectDirectory, ".gitignore"));
+    throw new Error("Capture unexpectedly modified the project-root .gitignore");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+
   const captureArchived = assertSuccessful(
     await client.callTool({
       name: "figure_capture_archive",
-      arguments: { captureId },
+      arguments: { projectDirectory, captureId },
     }),
     "capture archive smoke call",
   );
@@ -443,7 +555,7 @@ try {
   const captureRestored = assertSuccessful(
     await client.callTool({
       name: "figure_capture_restore",
-      arguments: { captureId },
+      arguments: { projectDirectory, captureId },
     }),
     "capture restore smoke call",
   );
@@ -454,7 +566,7 @@ try {
   const cleanupBeforeMaterialization = assertSuccessful(
     await client.callTool({
       name: "figure_capture_plan_cleanup",
-      arguments: { captureId, mode: "prune_payload" },
+      arguments: { projectDirectory, captureId, mode: "prune_payload" },
     }),
     "capture cleanup readiness before materialization",
   );
@@ -485,6 +597,7 @@ try {
   const spoofedRuleAssessment = await client.callTool({
     name: "figure_library_plan_working_revision",
     arguments: {
+      projectDirectory,
       templateId: "smoke-spoofed-rule-source",
       mode: "create",
       captureId,
@@ -512,6 +625,7 @@ try {
     await client.callTool({
       name: "figure_library_plan_working_revision",
       arguments: {
+        projectDirectory,
         templateId: versionedTemplateId,
         mode: "create",
         captureId,
@@ -564,6 +678,7 @@ try {
   const missingExpectedState = await client.callTool({
     name: "figure_library_apply_working_revision",
     arguments: {
+      projectDirectory,
       planDigest: workingPlanV1.planDigest,
       operationId: "smoke-working-v1-missing-expected-state",
       expectedAction: "create_working",
@@ -578,6 +693,7 @@ try {
     await client.callTool({
       name: "figure_library_apply_working_revision",
       arguments: {
+        projectDirectory,
         planDigest: workingPlanV1.planDigest,
         operationId: "smoke-working-v1",
         expectedAction: "create_working",
@@ -696,7 +812,7 @@ try {
   const cleanupAfterMaterialization = assertSuccessful(
     await client.callTool({
       name: "figure_capture_plan_cleanup",
-      arguments: { captureId, mode: "prune_payload" },
+      arguments: { projectDirectory, captureId, mode: "prune_payload" },
     }),
     "capture cleanup readiness after versioned materialization",
   );
@@ -707,6 +823,7 @@ try {
   const cleanupApply = await client.callTool({
     name: "figure_capture_apply_cleanup",
     arguments: {
+      projectDirectory,
       captureId,
       mode: "prune_payload",
       operationId: "smoke-cleanup-disabled",
@@ -724,6 +841,7 @@ try {
     await client.callTool({
       name: "figure_library_plan_working_revision",
       arguments: {
+        projectDirectory,
         templateId: versionedTemplateId,
         mode: "create",
         captureId,
@@ -765,6 +883,7 @@ try {
     await client.callTool({
       name: "figure_library_apply_working_revision",
       arguments: {
+        projectDirectory,
         planDigest: workingPlanV2.planDigest,
         operationId: "smoke-working-v2",
         expectedAction: "create_working",
@@ -777,7 +896,12 @@ try {
   const workingAppliedV2 = lifecycleApplyResult(workingAppliedV2Result);
   const plannedContentV2 = workingPlanV2.content ?? workingPlanV2Output.content;
   const revisionV2 = workingAppliedV2.revisionId ?? plannedContentV2?.revisionId;
-  if (typeof revisionV2 !== "string" || revisionV2 === revisionV1) {
+  const digestV2 = workingAppliedV2.contentDigest ?? plannedContentV2?.contentDigest;
+  if (
+    typeof revisionV2 !== "string" ||
+    revisionV2 === revisionV1 ||
+    typeof digestV2 !== "string"
+  ) {
     throw new Error("working revision v2 was not a new immutable revision");
   }
 
@@ -840,6 +964,166 @@ try {
   );
   if (lifecycleApplyResult(publishAppliedV2).revisionId !== revisionV2) {
     throw new Error("publish v2 did not atomically switch the Published Head");
+  }
+
+  const projectStatusBefore = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_project_status",
+      arguments: { projectDirectory },
+    }),
+    "empty project template status",
+  );
+  if (
+    projectStatusBefore.structuredContent?.status?.status !== "missing" ||
+    projectStatusBefore.structuredContent?.status?.templates?.length !== 0
+  ) {
+    throw new Error("new plotting project did not begin with an explicit missing project lock");
+  }
+
+  const projectUsePlanResult = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_plan_project_use",
+      arguments: {
+        projectDirectory,
+        templateId: versionedTemplateId,
+        revisionId: revisionV2,
+        contentDigest: digestV2,
+        allowNetwork: false,
+      },
+    }),
+    "exact Published project-use plan",
+  );
+  const projectUsePlan = lifecyclePlan(projectUsePlanResult);
+  if (
+    projectUsePlan.action !== "create" ||
+    projectUsePlan.desired?.templateId !== versionedTemplateId ||
+    projectUsePlan.desired?.revisionId !== revisionV2 ||
+    projectUsePlan.desired?.contentDigest !== digestV2 ||
+    projectUsePlan.expectedProjectLockDigest !== null ||
+    typeof projectUsePlan.planDigest !== "string"
+  ) {
+    throw new Error(
+      `project-use plan did not lock the exact Published revision: ${JSON.stringify(
+        projectUsePlanResult.structuredContent,
+      )}`,
+    );
+  }
+  const projectUseAppliedResult = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_apply_project_use",
+      arguments: {
+        projectDirectory,
+        plan: projectUsePlan,
+        planDigest: projectUsePlan.planDigest,
+        expectedAction: projectUsePlan.action,
+        expectedProjectLockDigest: projectUsePlan.expectedProjectLockDigest,
+        operationId: "smoke-project-use-v2",
+        allowNetwork: false,
+      },
+    }),
+    "exact Published project-use apply",
+  );
+  const projectUseApplied = lifecycleApplyResult(projectUseAppliedResult);
+  if (
+    projectUseApplied.action !== "create" ||
+    projectUseApplied.templateId !== versionedTemplateId ||
+    projectUseApplied.revisionId !== revisionV2 ||
+    projectUseApplied.contentDigest !== digestV2 ||
+    projectUseApplied.reused !== false ||
+    !String(projectUseApplied.target ?? "").startsWith(
+      path.join(projectDirectory, ".wisp", "figure-library", "templates"),
+    )
+  ) {
+    throw new Error("project-use Apply did not materialize the exact immutable Published snapshot");
+  }
+
+  const projectLockPath = path.join(
+    projectDirectory,
+    ".wisp",
+    "figure-library",
+    "project.lock.json",
+  );
+  const projectLockBeforeReuse = await fs.readFile(projectLockPath, "utf8");
+  const projectLockBeforeReuseStat = await fs.stat(projectLockPath);
+  const projectLock = JSON.parse(projectLockBeforeReuse);
+  const activeProjectPin = projectLock.templates?.find(
+    (item) => item.templateId === versionedTemplateId,
+  )?.active;
+  if (
+    activeProjectPin?.revisionId !== revisionV2 ||
+    activeProjectPin?.contentDigest !== digestV2 ||
+    projectLockBeforeReuse.includes(projectDirectory) ||
+    projectLockBeforeReuse.includes(libraryDirectory)
+  ) {
+    throw new Error("project.lock.json did not contain only the portable exact Published pin");
+  }
+
+  const projectStatusAfter = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_project_status",
+      arguments: { projectDirectory },
+    }),
+    "ready project template status",
+  );
+  const pinnedStatus = projectStatusAfter.structuredContent?.status;
+  const pinnedTemplate = pinnedStatus?.templates?.find(
+    (item) => item.templateId === versionedTemplateId,
+  );
+  if (
+    pinnedStatus?.status !== "ready" ||
+    pinnedTemplate?.active?.revisionId !== revisionV2 ||
+    pinnedTemplate?.active?.contentDigest !== digestV2 ||
+    pinnedTemplate?.snapshots?.[0]?.integrity !== "ready" ||
+    pinnedTemplate?.updateAvailable !== false
+  ) {
+    throw new Error("project status did not verify the exact active snapshot and current Published pin");
+  }
+
+  const projectReusePlanResult = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_plan_project_use",
+      arguments: {
+        projectDirectory,
+        templateId: versionedTemplateId,
+        revisionId: revisionV2,
+        contentDigest: digestV2,
+        allowNetwork: false,
+      },
+    }),
+    "exact project pin reuse plan",
+  );
+  const projectReusePlan = lifecyclePlan(projectReusePlanResult);
+  if (
+    projectReusePlan.action !== "reuse" ||
+    projectReusePlan.expectedProjectLockDigest !== pinnedStatus.projectLockDigest
+  ) {
+    throw new Error("same exact active project pin was not planned as zero-write reuse");
+  }
+  const projectReuseResult = assertSuccessful(
+    await client.callTool({
+      name: "figure_library_apply_project_use",
+      arguments: {
+        projectDirectory,
+        plan: projectReusePlan,
+        planDigest: projectReusePlan.planDigest,
+        expectedAction: "reuse",
+        expectedProjectLockDigest: projectReusePlan.expectedProjectLockDigest,
+        operationId: "smoke-project-reuse-v2",
+        allowNetwork: false,
+      },
+    }),
+    "exact project pin reuse apply",
+  );
+  const projectReuse = lifecycleApplyResult(projectReuseResult);
+  if (
+    projectReuse.action !== "reuse" ||
+    projectReuse.reused !== true ||
+    projectReuse.revisionId !== revisionV2 ||
+    projectReuse.contentDigest !== digestV2 ||
+    (await fs.readFile(projectLockPath, "utf8")) !== projectLockBeforeReuse ||
+    (await fs.stat(projectLockPath)).mtimeMs !== projectLockBeforeReuseStat.mtimeMs
+  ) {
+    throw new Error("project reuse unexpectedly rewrote or changed the exact active pin");
   }
 
   const versionHistory = assertSuccessful(
@@ -1193,9 +1477,14 @@ try {
 
   const sourceStatus = await client.callTool({
     name: "figure_library_source_status",
-    arguments: {},
+    arguments: { projectDirectory },
   });
-  if (sourceStatus.isError || sourceStatus.structuredContent?.userTemplateCount !== 3) {
+  if (
+    sourceStatus.isError ||
+    sourceStatus.structuredContent?.userTemplateCount !== 3 ||
+    sourceStatus.structuredContent?.captureStatus?.source !== "project" ||
+    sourceStatus.structuredContent?.captureStatus?.root !== captureDirectory
+  ) {
     throw new Error("source status smoke call failed");
   }
 
@@ -1313,7 +1602,7 @@ try {
   }
 
   console.log(
-    `OK: ${names.join(", ")}; offline Capture open/article/list/get/asset/archive/restore/cleanup guard; immutable Working/Review Gate/Publish v1-v2 lifecycle; Published/Working diff and history; exact historical describe/preview/materialize; restore-as-new-Working/discard; explicit non-destructive legacy adoption; legacy import plus plan/apply/archive/audit lifecycle; diff/upsert/sync; user search/materialization; app resource; hard stop${materialized}`,
+    `OK: ${names.join(", ")}; project-bound source status and project-local Capture open/article/list/get/asset/annotation pages/archive/restore/cleanup guard; immutable Working/Review Gate/Publish v1-v2 lifecycle; exact Published project plan/apply/status/zero-write reuse pin; Published/Working diff and history; exact historical describe/preview/materialize; restore-as-new-Working/discard; explicit non-destructive legacy adoption; legacy import plus plan/apply/archive/audit lifecycle; diff/upsert/sync; user search/materialization; app resource; hard stop${materialized}`,
   );
 } finally {
   await client.close().catch(() => undefined);
