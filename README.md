@@ -1,5 +1,10 @@
 # Scientific Figure Library
 
+> **Experimental snapshot:** version 0.4.2 on this branch preserves the Web
+> Capture, Annotation, and project-pin implementation for maintainer review.
+> It is not the proposed default core architecture. See
+> [`docs/EXPERIMENTAL_CAPTURE_0.4.2.md`](docs/EXPERIMENTAL_CAPTURE_0.4.2.md).
+
 Scientific Figure Library is a standard MCP server and MCP App for finding,
 importing, and materializing scientific figure references. It is not tied to
 Wisp: any stdio MCP host can use it. The included Wisp manifest and Skill are a
